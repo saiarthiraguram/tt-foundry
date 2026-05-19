@@ -321,14 +321,22 @@ Write `.claude/bringup/<model_key>/escalation_report.md` containing:
   Mode             : bringup | retriage
   ```
 - model_key, arch, total iterations
-- Each iteration: stage, diagnosis (with `source: json_report|stdout_fallback`),
+- Each iteration: stage, diagnosis (with `source: json_report|stdout_fallback`
+  and `last_stage` from the run's `._bringup_stage.txt` marker),
   repair attempted, links to `iter_<N>_run.log` and `iter_<N>_result.json`
-- Final failure category and confidence
+- Final failure category, confidence, and last compilation stage reached
+  (`FE_COMPILATION` / `TTMLIR_COMPILATION` / `RUNTIME_EXECUTION` / `unknown`)
 - Recommended next human action
 
 ## Progress Display
 After each stage transition, print a one-line status:
 `[model_key] stage=<STAGE> iteration=<N> → <result>`
+
+If the last run recorded `state.details.last_stage` (set by
+`model-bringup-run` from `._bringup_stage.txt`) and the stage is not
+`unknown`, append it: `... → <result> last_stage=<value>`. This makes
+the compilation-stage trail visible in the orchestrator output without
+having to open the log.
 
 ## Bringup Steps Log
 Maintain `.claude/bringup/<safe_key>/bringup_steps.txt` throughout the pipeline run.
@@ -366,6 +374,7 @@ FINAL RESULT
   Loader created  : yes | no
   Applied patches : <list or 'none'>
   Duration        : <total seconds>s
+  Last stage      : <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
   YAML entry      : <key added to YAML or 'none'>
 ================================================================================
 ```
@@ -399,6 +408,7 @@ On ESCALATED:
 ```
 ✗ <model_key> — ESCALATED
   Reason: <last failure_reason>
+  Last stage: <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
   Report: .claude/bringup/<model_key>/escalation_report.md
   Steps log: .claude/bringup/<safe_key>/bringup_steps.txt
 ```

@@ -17,6 +17,37 @@ diagnosis that the repair stage can act on.
 
 ## Input precedence
 
+### Compilation stage as a primary signal
+
+Before regex / JSON parsing, read `state.details.last_stage` (mirrored by
+`model-bringup-run` from `._bringup_stage.txt`). It is one of:
+
+- `FE_COMPILATION`     — failure during StableHLO emission
+- `TTMLIR_COMPILATION` — failure during the tt-mlir pass pipeline
+- `RUNTIME_EXECUTION`  — failure during on-device execution
+- `unknown`            — no stage marker (Python-side crash before C++)
+
+`last_stage` is a *coarse* anchor and on its own is not enough — multiple
+root causes can share a stage. But it disambiguates patterns that would
+otherwise collide. Use it after pattern matching to refine the verdict:
+
+| Pattern match | Stage signal | Refined `root_cause_category` |
+|---|---|---|
+| `missing_op` | `FE_COMPILATION`     | `missing_op_stablehlo`     (StableHLO emission gap — usually framework-side) |
+| `missing_op` | `TTMLIR_COMPILATION` | `missing_op_ttmlir`        (tt-mlir lowering gap — file an op-coverage issue) |
+| `oom`        | `TTMLIR_COMPILATION` | `oom_compile`              (memory plan failed before execution — shard/tile size issue) |
+| `oom`        | `RUNTIME_EXECUTION`  | `oom_runtime`              (L1/DRAM exhausted at execution — input-size or kernel-config issue) |
+| `runtime_mismatch` | `FE_COMPILATION` | `runtime_mismatch_fe`   (shape/dtype mismatch caught pre-compile — loader bug) |
+| `runtime_mismatch` | `RUNTIME_EXECUTION` | `runtime_mismatch_rt` (mismatch only at execution — likely PJRT/runtime issue) |
+| anything else | (any)               | (keep base category, just stamp `details.last_stage`) |
+
+If `last_stage` is `unknown`, fall back to base categories — do not invent
+a stage. Refined categories take precedence over base ones in confidence
+scoring: a category that fuses a regex match *and* a corroborating stage
+is `high`; a regex match with `unknown` stage caps at `medium`.
+
+### JSON report
+
 Always prefer the JSON report when present (model-bringup-run writes one by
 default at `logs/iter_<N>_result.json`). If `--json-report` is supplied or
 a file exists at the conventional path:
@@ -107,9 +138,13 @@ Print the diagnosis as JSON conforming exactly to this schema:
   "root_cause_category": "<value>",
   "suggested_repair_strategy": "<value>",
   "confidence": "high | medium | low",
-  "escalation_skill": "runtime-failure-debugger" | null
+  "escalation_skill": "runtime-failure-debugger" | null,
+  "last_stage": "FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown"
 }
 ```
+
+`last_stage` is copied through from `state.details.last_stage` (set by
+`model-bringup-run`). It is `unknown` when no stage marker was written.
 Set `escalation_skill` to:
 - `"runtime-failure-debugger"` when `suggested_repair_strategy` is `runtime_debug`
 - `"graph-break-analysis"` when `suggested_repair_strategy` is `graph_break_analysis`
@@ -119,6 +154,7 @@ Then print a human-readable summary:
 ```
 [diagnose] iter=<N>
   root_cause:  <category>
+  last_stage:  <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
   strategy:    <strategy>
   confidence:  <level>
   excerpt:     <first 3 lines of the matching log region>
@@ -137,6 +173,7 @@ Append to `state.json` history:
     "log": "<log_path>",
     "json_report": "<path or 'missing'>",
     "source": "json_report | stdout_fallback",
+    "last_stage": "<FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>",
     "tt_xla_sha": "<short sha of tt-xla HEAD>",
     "tt_foundry_sha": "<short sha if tt-foundry submodule is present, else null>"
   }
@@ -156,6 +193,7 @@ Append to `.claude/bringup/<safe_key>/bringup_steps.txt`:
 STEP <N> — Diagnose (model-bringup-diagnose, iteration <N>)
 --------------------------------------------------------------------------------
 Log analysed  : <log_path>
+Last stage    : <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
 Root cause    : <category>
 Strategy      : <suggested_repair_strategy>
 Escalation    : <runtime-failure-debugger or 'none'>
@@ -163,5 +201,5 @@ Confidence    : <level>
 Excerpt       :
   <first 3 lines of the matching log region>
 
-DIAGNOSE RESULT: <category>:<confidence>
+DIAGNOSE RESULT: <category>:<confidence> (stage=<last_stage>)
 ```

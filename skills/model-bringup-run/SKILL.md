@@ -72,12 +72,23 @@ explicit `--timeout` arg). Then:
 
 ```bash
 mkdir -p .claude/bringup/<safe_key>/logs
-TT_XLA_ARCH=<arch> timeout $TIMEOUT_S python -m pytest <test_node_ids> \
+ENABLE_BRINGUP_STAGE_LOGGING=1 TT_XLA_ARCH=<arch> timeout $TIMEOUT_S python -m pytest <test_node_ids> \
   -svv --tb=long -p no:cacheprovider \
   --json-report --json-report-file=.claude/bringup/<safe_key>/logs/iter_<N>_result.json \
   2>&1 | tee .claude/bringup/<safe_key>/logs/iter_<N>_run.log
 exit_code=${PIPESTATUS[0]}
 ```
+
+`ENABLE_BRINGUP_STAGE_LOGGING=1` makes the C++ pipeline write the current
+compilation stage to `._bringup_stage.txt` at the tt-xla repo root. The
+file is updated as the pipeline progresses through
+`FE_COMPILATION_START` → `TTMLIR_COMPILATION_START` → `RUNTIME_EXECUTION_START`,
+so on failure its final content tells us **which stage the model died in**.
+Step 4 reads it and records `details.last_stage` so DIAGNOSE can route
+patterns correctly (e.g. `missing_op@FE_COMPILATION` is a StableHLO emission
+gap, while `missing_op@TTMLIR_COMPILATION` is a tt-mlir lowering gap — very
+different repair strategies). conftest.py owns lifecycle of the file;
+this skill must **not** delete it.
 
 Flag rationale (same as model_issue_pick):
 - **`-s`**: no stdout capture → live progress (downloads, compile traces,
@@ -113,7 +124,7 @@ calls** so the user can reply:
 
 Please run the test yourself with a longer budget and share the log:
 
-  TT_XLA_ARCH=<arch> timeout 1800 python -m pytest \
+  ENABLE_BRINGUP_STAGE_LOGGING=1 TT_XLA_ARCH=<arch> timeout 1800 python -m pytest \
     '<test_node_id>' \
     -svv --tb=long -p no:cacheprovider \
     --json-report --json-report-file=/tmp/<safe_key>_manual.json \
@@ -152,7 +163,12 @@ Inspect the tail of the manual log and classify:
 
 When recording a passed/failed result from a manual log, use the manual log
 path in `details.log` and add `details.source: "manual_run"` plus the budget
-the user used (`details.manual_timeout_seconds`).
+the user used (`details.manual_timeout_seconds`). Re-run Step 4 (read
+`._bringup_stage.txt`) right after the user's reply — their manual run
+overwrote the marker, so it now reflects the longer-budget verdict.
+If `._bringup_stage.txt` is missing or pre-dates the manual run, record
+`details.last_stage: "unknown"` rather than carrying the stale value
+from the auto-run.
 
 #### 3c. Fallback: original TIMEOUT/UNKNOWN escalation
 
@@ -185,7 +201,36 @@ Output:
   log: .claude/bringup/<safe_key>/logs/iter_<N>_run.log
 ```
 
-### 4. Record result in state.json (non-timeout)
+### 4. Read the compilation-stage marker
+
+Before reading the JSON report, capture the last compilation stage the
+pipeline reached. This is independent of pass/fail/timeout — useful for
+PASSED runs too as a "what was actually exercised" stamp.
+
+```bash
+stage_file=._bringup_stage.txt   # at tt-xla repo root
+if [ -f "$stage_file" ]; then
+    last_stage_raw=$(tr -d '[:space:]' < "$stage_file")
+else
+    last_stage_raw=""
+fi
+```
+
+Map the raw marker to a canonical value for state.json:
+
+| `._bringup_stage.txt` content | `details.last_stage` |
+|---|---|
+| `FE_COMPILATION_START`       | `FE_COMPILATION`     |
+| `TTMLIR_COMPILATION_START`   | `TTMLIR_COMPILATION` |
+| `RUNTIME_EXECUTION_START`    | `RUNTIME_EXECUTION`  |
+| empty / file missing / other | `unknown`            |
+
+`unknown` is expected for crashes that happen before the C++ pipeline
+gets a chance to write the file (e.g. import errors, loader exceptions in
+Python). DIAGNOSE treats `unknown` as "no stage signal, fall back to
+stdout patterns alone."
+
+### 5. Record result in state.json (non-timeout)
 
 Read the JSON report at `logs/iter_<N>_result.json` (written by
 `pytest-json-report`). Use it to populate richer fields than the stdout
@@ -218,12 +263,16 @@ Append to `history`:
     "bringup_status": "<from json tags, if present>",
     "pcc": <from json tags, if present>,
     "pcc_threshold": <from json tags, if present>,
-    "failing_reason": "<from json tags, if present>"
+    "failing_reason": "<from json tags, if present>",
+    "last_stage": "FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown"
   }
 }
 ```
 
-### 5. Write to bringup_steps.txt
+Also mirror `last_stage` into `state.details.last_stage` (top-level
+shortcut for downstream skills that don't want to walk history).
+
+### 6. Write to bringup_steps.txt
 
 Append to `.claude/bringup/<safe_key>/bringup_steps.txt`:
 ```
@@ -238,18 +287,19 @@ Log     : .claude/bringup/<safe_key>/logs/iter_<N>_run.log
 JSON    : .claude/bringup/<safe_key>/logs/iter_<N>_result.json
 Duration: <Xs>
 Exit    : <exit_code>
+Stage   : <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
 
 Test result summary:
   <last 3 lines of pytest output, e.g. "1 passed" or "1 failed">
 
 RUN RESULT: PASSED | FAILED | TIMEOUT
 [If TIMEOUT:]  Marking as UNKNOWN — exceeded 5-minute execution limit.
-[If FAILED:]   Passing log to DIAGNOSE stage.
+[If FAILED:]   Passing log to DIAGNOSE stage (last_stage=<value>).
 ```
 
-### 6. Output (non-timeout)
+### 7. Output (non-timeout)
 ```
-[run] iter=<N>  result=<PASSED|FAILED>  duration=<Xs>
+[run] iter=<N>  result=<PASSED|FAILED>  duration=<Xs>  stage=<last_stage>
   log: .claude/bringup/<safe_key>/logs/iter_<N>_run.log
 ```
 
