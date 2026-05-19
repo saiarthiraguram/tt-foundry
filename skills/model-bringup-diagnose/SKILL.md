@@ -79,7 +79,7 @@ Scan the log for these patterns in order (first match wins):
 |---|---|---|
 | `graph_break` | `torch._dynamo.exc.Unsupported`, `graph break`, `Unsupported: ` | `monkey_patch` |
 | `oom` | `DRAM OOM`, `Out of memory`, `Killed`, `ResourceExhaustedError` | `adjust_oom_config` |
-| `pcc_low` | `PCC=<value> (required=`, `pcc.*FAIL`, `AssertionError.*pcc` | `lower_pcc_threshold` |
+| `pcc_low` | `PCC=<value> (required=`, `pcc.*FAIL`, `AssertionError.*pcc` | `runtime_debug` (always — set `escalation_skill: "runtime-failure-debugger"`) |
 | `missing_op` | `NotImplementedError`, `not supported by the tt backend`, `Unsupported node: aten.` | `escalate` |
 | `runtime_mismatch` | `shape mismatch`, `RuntimeError.*size`, `Expected.*got.*tensor` | `fix_output_handling` |
 | `import_error` | `ImportError`, `ModuleNotFoundError` | `escalate` |
@@ -99,18 +99,22 @@ unlikely to resolve the failure. Pick at most one per diagnosis.
 Override `suggested_repair_strategy: "runtime_debug"` and set
 `escalation_skill: "runtime-failure-debugger"` when **any** of these hold:
 
-1. Confidence would otherwise be `low` AND the failure is a runtime fault
-   (`oom`, `pcc_low`, `runtime_mismatch`, or `unknown` with a Python/runtime
+1. `root_cause_category` is `pcc_low`. PCC failures **always** route to
+   the runtime-failure-debugger — there is no cheap "lower the threshold"
+   strategy. Relaxing the bar is not a fix; the debugger isolates the
+   offending op so a real repair (or a justified threshold change with
+   evidence) can be made.
+2. Confidence would otherwise be `low` AND the failure is a runtime fault
+   (`oom`, `runtime_mismatch`, or `unknown` with a Python/runtime
    traceback) — i.e. there is real signal to debug, just not enough to pick
    a one-shot fix.
-2. `state.json` history shows the previous iteration already applied the
+3. `state.json` history shows the previous iteration already applied the
    default strategy for this same `root_cause_category` without resolving it
    (e.g. `adjust_oom_config` was tried and the new log shows the same OOM
-   byte-count, or `lower_pcc_threshold` was tried and PCC is still failing).
-3. The matched pattern is `oom` or `pcc_low` and the log indicates the
-   failure is op-config-driven rather than input-driven (e.g. byte-identical
-   L1 budget regardless of input size, or PCC drop on a single intermediate
-   tensor).
+   byte-count).
+4. The matched pattern is `oom` and the log indicates the failure is
+   op-config-driven rather than input-driven (e.g. byte-identical L1 budget
+   regardless of input size).
 
 Do **not** use `runtime_debug` for `missing_op` or `import_error` — those
 still escalate to a human (the debugger cannot synthesise a missing op).

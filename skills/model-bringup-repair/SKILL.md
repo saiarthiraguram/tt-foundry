@@ -1,6 +1,6 @@
 ---
 name: model-bringup-repair
-description: Patch and repair stage of the model bringup pipeline. Applies the repair strategy from diagnosis (monkey_patch, lower_pcc_threshold, adjust_oom_config, fix_output_handling, runtime_debug, or escalate). The runtime_debug strategy delegates to the runtime-failure-debugger skill for systematic op-level analysis. Runs code-reviewer skill before finalizing any patch. Invoked by the model-bringup orchestrator at the REPAIR stage.
+description: Patch and repair stage of the model bringup pipeline. Applies the repair strategy from diagnosis (monkey_patch, adjust_oom_config, fix_output_handling, runtime_debug, or escalate). PCC failures always route to the runtime-failure-debugger via runtime_debug — there is no cheap "lower the threshold" strategy. Runs code-reviewer skill before finalizing any patch. Invoked by the model-bringup orchestrator at the REPAIR stage.
 allowed-tools: Bash Read Write Edit Grep Glob
 ---
 
@@ -27,13 +27,6 @@ Apply the repair strategy indicated by the diagnosis. Write any patch to
    replace it with a graph-break-safe equivalent, or remove the unsupported path).
 4. Inject the import of the patch at the top of `model_utils.py` in the test directory.
 5. Set `requires_human_review: true` — do not apply without confirmation.
-
-### `lower_pcc_threshold`
-1. Extract the measured PCC from the log (pattern: `PCC=<value>`).
-2. Compute `suggested = max(0.90, measured_pcc - 0.01)`.
-3. Locate the `pcc=` kwarg in the pytest fixture for this variant.
-4. Edit the value in the test file directly.
-5. Record the old and new values in the patch log.
 
 ### `adjust_oom_config`
 Try strategies in order, stopping when one resolves the OOM:
@@ -206,9 +199,9 @@ ends up editing source — run a small **sanity regression set** before the
 orchestrator transitions to VERIFY. The purpose is to catch patches that
 fix the target model but break unrelated coverage.
 
-**Skipped** for `lower_pcc_threshold` (config-only), `adjust_oom_config`
-(config-only), `runtime_debug` (no source edits), and `escalate` (no
-patch). For these, set `details.regression_check: "skipped_no_source_change"`.
+**Skipped** for `adjust_oom_config` (config-only), `runtime_debug` (no
+source edits), and `escalate` (no patch). For these, set
+`details.regression_check: "skipped_no_source_change"`.
 
 **Sanity set** (3 fast EXPECTED_PASSING tests, chosen for diversity):
 - `resnet/pytorch-ResNet50_HuggingFace-single_device-inference`
