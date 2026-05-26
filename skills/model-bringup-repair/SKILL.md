@@ -262,11 +262,22 @@ The orchestrator reads `sanity_test_path` to gate VERIFY (sanity passes
 before the full model test re-runs).
 
 ## Bringup Steps Log
+
+Timing capture: `_step_start_ts`/`_step_start_iso` at the very start of this
+skill's execution; `_step_end_ts`/`_step_end_iso` after the patch / debug
+report is written and code review completes. For the `runtime_debug` strategy
+the elapsed will dominate the whole pipeline — that is expected and the
+captured wall-clock is the data point we want for the timing study.
+
 Append to `.claude/bringup/<safe_key>/bringup_steps.txt`:
 ```
 --------------------------------------------------------------------------------
 STEP <N> — Repair (model-bringup-repair, iteration <N>)
 --------------------------------------------------------------------------------
+Start    : <_step_start_iso>
+End      : <_step_end_iso>
+Elapsed  : <_step_end_ts - _step_start_ts>s
+
 Strategy        : <strategy>
 Patch file      : <patch_path or 'none'>
 Debug report    : <debug_report_path or 'none'>     # runtime_debug only

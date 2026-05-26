@@ -274,18 +274,29 @@ shortcut for downstream skills that don't want to walk history).
 
 ### 6. Write to bringup_steps.txt
 
+Timing capture: `_step_start_ts`/`_step_start_iso` at the very start of this
+skill's execution (before collect); `_step_end_ts`/`_step_end_iso` after the
+pytest run completes and logs are flushed. `Elapsed` is the full step
+wall-clock (includes collect + pytest + log post-processing). `Duration`
+below is the pytest sub-process only — keep both because the difference is
+useful for diagnosing slow collect or large-log handling.
+
 Append to `.claude/bringup/<safe_key>/bringup_steps.txt`:
 ```
 --------------------------------------------------------------------------------
 STEP <N> — First Run / Verify (model-bringup-run, iteration <N>)
 --------------------------------------------------------------------------------
+Start    : <_step_start_iso>
+End      : <_step_end_iso>
+Elapsed  : <_step_end_ts - _step_start_ts>s
+
 Collect : pytest -q --collect-only tests/runner/test_models.py | grep '<family>/pytorch-...'
 Node IDs: <list of discovered test node IDs>
 Budget  : <TIMEOUT_S>s (auto from name heuristic | --timeout override)
 Command : TT_XLA_ARCH=<arch> timeout $TIMEOUT_S python -m pytest <test_node_ids> -svv --tb=long --json-report --json-report-file=...
 Log     : .claude/bringup/<safe_key>/logs/iter_<N>_run.log
 JSON    : .claude/bringup/<safe_key>/logs/iter_<N>_result.json
-Duration: <Xs>
+Duration: <Xs>  (pytest only)
 Exit    : <exit_code>
 Stage   : <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
 

@@ -191,11 +191,20 @@ classifications later.
 Also append `<category>:<confidence>` to `failure_reasons` in state.json.
 
 ## Bringup Steps Log
+
+Timing capture: `_step_start_ts`/`_step_start_iso` at the very start of this
+skill's execution (before reading the log); `_step_end_ts`/`_step_end_iso`
+after the pattern match and state update finish.
+
 Append to `.claude/bringup/<safe_key>/bringup_steps.txt`:
 ```
 --------------------------------------------------------------------------------
 STEP <N> — Diagnose (model-bringup-diagnose, iteration <N>)
 --------------------------------------------------------------------------------
+Start    : <_step_start_iso>
+End      : <_step_end_iso>
+Elapsed  : <_step_end_ts - _step_start_ts>s
+
 Log analysed  : <log_path>
 Last stage    : <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
 Root cause    : <category>

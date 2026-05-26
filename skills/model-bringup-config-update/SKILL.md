@@ -98,11 +98,26 @@ If `--apply` WAS passed: continue with the per-result branches below.
 
 ### 4. Write to bringup_steps.txt
 
+Timing capture: `_step_start_ts`/`_step_start_iso` at the very start of this
+skill's execution; `_step_end_ts`/`_step_end_iso` after the YAML and fixture
+edits are flushed. After that, also capture pipeline-level totals:
+```bash
+_pipeline_end_ts=$(date +%s)
+_pipeline_end_iso=$(date -Iseconds)
+_pipeline_start_ts=$(jq -r '.pipeline_start_ts' .claude/bringup/<safe_key>/state.json)
+_total_elapsed_s=$((_pipeline_end_ts - _pipeline_start_ts))
+# Human-readable form: Xh Ym Zs (drop leading 0h / 0m components)
+```
+
 Append to `.claude/bringup/<safe_key>/bringup_steps.txt`:
 ```
 --------------------------------------------------------------------------------
 STEP <N> — Config Update (model-bringup-config-update)
 --------------------------------------------------------------------------------
+Start    : <_step_start_iso>
+End      : <_step_end_iso>
+Elapsed  : <_step_end_ts - _step_start_ts>s
+
 Result        : PASSED | TIMEOUT | ESCALATED
 
 bringup_status updated:
@@ -121,7 +136,25 @@ YAML config updated:
 CONFIG UPDATE RESULT: PASSED | TIMEOUT | ESCALATED
 ```
 
-Then close the file with the final summary block (see orchestrator SKILL.md for format).
+Then close the file with the final summary block. Use the pipeline-level
+totals captured above:
+```
+================================================================================
+FINAL RESULT
+================================================================================
+<✓|✗> <model_key> — <PASSED|ESCALATED|TIMEOUT> after <N> repair iteration(s)
+  Loader created  : yes | no
+  Applied patches : <list or 'none'>
+  Start time      : <pipeline_start_iso from state.json>
+  End time        : <_pipeline_end_iso>
+  Total elapsed   : <Xh Ym Zs>  (<_total_elapsed_s>s)
+  YAML entry      : <key added to YAML or 'none'>
+================================================================================
+```
+
+Also persist `pipeline_end_ts`, `pipeline_end_iso`, and `total_elapsed_seconds`
+in `state.json` so a downstream aggregator (e.g. a multi-model timing study)
+can read structured timing data without re-parsing the .txt log.
 
 ### 5. Output
 

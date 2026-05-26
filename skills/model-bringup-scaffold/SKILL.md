@@ -312,8 +312,16 @@ Append history entry: `{ "stage": "validate", "result": "passed", "details": { "
 
 ## Step 6 — Write to bringup_steps.txt
 
+Timing capture: at the very start of this skill's execution (Step 1), capture
+`_step_start_ts=$(date +%s)` and `_step_start_iso=$(date -Iseconds)`. After
+all scaffold work (validation, loader synth, state init) finishes, capture
+`_step_end_ts=$(date +%s)` and `_step_end_iso=$(date -Iseconds)`. These
+values are emitted in the section below.
+
 Append a section to `.claude/bringup/<safe_key>/bringup_steps.txt`.
-If the file does not exist yet (first stage), write the header block first:
+If the file does not exist yet (first stage), write the header block first.
+The orchestrator has already recorded `pipeline_start_iso` in `state.json`;
+read it and emit it as the `Start time` line:
 ```
 ================================================================================
 MODEL BRINGUP LOG
@@ -321,6 +329,7 @@ MODEL BRINGUP LOG
 Model Key  : <model_key>
 Arch       : <arch>
 Date       : <YYYY-MM-DD>
+Start time : <pipeline_start_iso from state.json>
 ================================================================================
 ```
 
@@ -329,6 +338,10 @@ Then append:
 --------------------------------------------------------------------------------
 STEP 1 — Parse & Scaffold (model-bringup-scaffold)
 --------------------------------------------------------------------------------
+Start    : <_step_start_iso>
+End      : <_step_end_iso>
+Elapsed  : <_step_end_ts - _step_start_ts>s
+
 Input model_key : <original model_key>
 Format detected : A (structured) | B (HuggingFace model ID)
 Normalized to   : family=<family>  variant=<variant>  parallelism=<p>  run_mode=<r>

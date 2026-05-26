@@ -56,9 +56,19 @@ All state lives at `.claude/bringup/<model_key_with_slashes_replaced_by_double_u
 
 ## Startup
 1. If `--resume` is set and `state.json` exists, load it and resume from the recorded stage.
+   Keep the existing `pipeline_start_ts` and `pipeline_start_iso` from state — we want
+   total elapsed to include the original run's wall clock, not just the resumed leg.
 2. Otherwise, if `state.json` exists, ask the user whether to resume or restart.
 3. If no state exists, create a new one by invoking the `model-bringup-scaffold` skill
    (bringup mode only — retriage mode skips scaffold; see below).
+4. **Record pipeline start time** before invoking the first stage:
+   ```bash
+   _pipeline_start_ts=$(date +%s)
+   _pipeline_start_iso=$(date -Iseconds)
+   ```
+   Persist both fields in `state.json` as `pipeline_start_ts` (unix epoch seconds)
+   and `pipeline_start_iso` (ISO 8601). Sub-skills read these for the header and
+   the final-summary computation.
 
 ## XFAIL Re-triage Mode (`--mode retriage`)
 
@@ -111,14 +121,21 @@ Stash the verdict (`xfail_same` | `xfail_changed`) in
 
 ### Logging
 Open `.claude/bringup/<safe_key>/bringup_steps.txt` with the same header
-block as standard bringup, but tag the mode:
+block as standard bringup (including `Start time`), but tag the mode:
 ```
 ================================================================================
 MODEL BRINGUP LOG (mode: retriage)
 ================================================================================
+Model Key  : <model_key>
+Arch       : <arch>
+Date       : <YYYY-MM-DD>
+Start time : <pipeline_start_iso>
+================================================================================
 ```
 Append one step section for the `model_issue_pick` invocation, then a step
 section per fall-through stage if `xfail_changed` routed into DIAGNOSE.
+Every step section follows the standard timing template (`Start:` /
+`End:` / `Elapsed:` at the top of the section).
 
 ## FSM Loop
 Run the following loop (max 5 iterations total across repair cycles).
@@ -362,19 +379,41 @@ MODEL BRINGUP LOG
 Model Key  : <model_key>
 Arch       : <arch>
 Date       : <YYYY-MM-DD>
+Start time : <pipeline_start_iso>
 ================================================================================
 ```
 
-Close it with a summary block when the pipeline ends:
+Each step section MUST include a timing block. Sub-skills capture
+`_step_start_ts=$(date +%s); _step_start_iso=$(date -Iseconds)` before doing
+their work and `_step_end_ts=$(date +%s); _step_end_iso=$(date -Iseconds)`
+after, then write the following lines as the first content of the section:
+```
+Start    : <_step_start_iso>
+End      : <_step_end_iso>
+Elapsed  : <_step_end_ts - _step_start_ts>s
+```
+
+Close the file with a summary block when the pipeline ends. The final
+summary is written by `model-bringup-config-update`, which reads
+`pipeline_start_ts` from `state.json` and computes the total elapsed:
+```bash
+_pipeline_end_ts=$(date +%s)
+_pipeline_end_iso=$(date -Iseconds)
+_total_elapsed_s=$((_pipeline_end_ts - $(jq -r '.pipeline_start_ts' state.json)))
+# Format as Hh Mm Ss for readability when over 60s
+```
+
 ```
 ================================================================================
 FINAL RESULT
 ================================================================================
-<✓|✗> <model_key> — <PASSED|ESCALATED> after <N> repair iteration(s)
+<✓|✗> <model_key> — <PASSED|ESCALATED|TIMEOUT> after <N> repair iteration(s)
   Loader created  : yes | no
   Applied patches : <list or 'none'>
-  Duration        : <total seconds>s
   Last stage      : <FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown>
+  Start time      : <pipeline_start_iso>
+  End time        : <_pipeline_end_iso>
+  Total elapsed   : <Xh Ym Zs>  (<total_elapsed_seconds>s)
   YAML entry      : <key added to YAML or 'none'>
 ================================================================================
 ```
