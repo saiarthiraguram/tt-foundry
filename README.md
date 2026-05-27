@@ -8,41 +8,51 @@ Tenstorrent hardware (PJRT / tt-xla / tt-forge-models).
 ```
 skills/
 ├── model-bringup/                    # E2E orchestrator (FSM)
-├── model-bringup-scaffold/           # VALIDATE stage  — loader scaffold + state.json
+├── model-bringup-scaffold/           # VALIDATE stage — loader scaffold + state.json (HuggingFace default)
+├── model-bringup-scaffold-github/    # VALIDATE variant — model source lives on GitHub (vendor or port)
+├── model-bringup-scaffold-pipeline/  # VALIDATE variant — multi-component HF DiffusionPipeline (per-component loaders, shard specs)
+├── model-bringup-overview/           # OVERVIEW stage — CPU sanity + golden.pt capture, model_overview.md
 ├── model-bringup-run/                # FIRST_RUN / VERIFY stages — pytest under 5-min budget
 ├── model-bringup-diagnose/           # DIAGNOSE stage — pattern-match failure log → JSON
-├── model-bringup-repair/             # REPAIR  stage  — apply strategy (monkey_patch, …)
-├── model-bringup-config-update/      # CONFIG_UPDATE  — write final YAML status
-├── runtime-failure-debugger/         # Op-level bisect for runtime_debug repairs
+├── model-bringup-repair/             # REPAIR stage — apply strategy (monkey_patch, runtime_debug, …)
+├── model-bringup-config-update/      # CONFIG_UPDATE stage — write final YAML status
+├── model-bringup-finalize/           # FINALIZE stage — multi-arch reverify, pre-commit, PR draft
+├── runtime-failure-debugger/         # Op-level bisect invoked by runtime_debug repair strategy
 ├── graph-break-analysis/             # Auxiliary: torch.compile graph-break investigation
 ├── model_issue_pick/                 # XFAIL re-triage (single entry)
 ├── failure_summary/                  # YAML digest of all KNOWN_FAILURE_XFAIL entries
-└── potential_new_models/             # SOTA bringup-candidate suggester
+├── potential_new_models/             # SOTA bringup-candidate suggester
+├── triage-unpack-forward-output/     # Triage FAILED_FE_COMPILATION "no unpack_forward_output" cases
+└── create-pr/                        # Open a tt-xla PR (area-prefixed title, body template, CODEOWNERS)
 ```
 
 ## High-level flow
 
 ```
-                          ┌──────────────────────┐
-   /model-bringup <key> ──▶│       model-bringup  │
-                          │      (orchestrator)  │
-                          └──────────────────────┘
-                                     │
-   ┌──────────┬──────────┬───────────┼────────────┬────────────────┐
-   ▼          ▼          ▼           ▼            ▼                ▼
-scaffold    run     diagnose      repair       verify       config-update
-                                     │
-                                     ▼
-                           runtime-failure-debugger
-                                     │
-                                     ▼
-                            graph-break-analysis
+                            ┌──────────────────────┐
+     /model-bringup <key> ──▶│      model-bringup   │
+                            │     (orchestrator)   │
+                            └──────────────────────┘
+                                       │
+   ┌─────────┬─────────┬─────────┬─────┴────┬─────────┬───────────────┬──────────┐
+   ▼         ▼         ▼         ▼          ▼         ▼               ▼          ▼
+scaffold  overview   run    diagnose     repair    verify     config-update   finalize
+   │                                        │
+   ├─ scaffold-github  (GitHub-hosted)      ▼
+   └─ scaffold-pipeline (DiffusionPipeline) runtime-failure-debugger
+                                            │
+                                            ▼
+                                  graph-break-analysis
 ```
 
-The three newer skills (`model_issue_pick`, `failure_summary`,
-`potential_new_models`) hang off the same FSM but enter from different
-states: re-triage existing XFAIL entries, digest the YAML for triage, and
-suggest the next bringup wave respectively.
+Auxiliary skills hang off the same FSM but enter from different states:
+
+- `model_issue_pick` — re-triage a single existing `KNOWN_FAILURE_XFAIL` entry
+- `failure_summary` — digest the XFAIL list for triage / sharing
+- `potential_new_models` — suggest the next wave of bringup candidates
+- `triage-unpack-forward-output` — fix one training-test failure pattern
+  (`FAILED_FE_COMPILATION` with "no unpack_forward_output handler")
+- `create-pr` — open the PR after `finalize` produces the branch + body draft
 
 ## Consuming tt-foundry from another repo
 

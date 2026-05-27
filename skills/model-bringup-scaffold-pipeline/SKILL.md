@@ -378,10 +378,10 @@ The runner-side updates needed so component tests actually execute:
    stage hasn't been run yet — caller's choice). Example:
    ```yaml
    playground_v2_5_1024px_aesthetic/pytorch-Aesthetic_1024px_unet-single_device-inference:
-     status: NEW
+     status: UNSPECIFIED
      required_pcc: 0.95
    playground_v2_5_1024px_aesthetic/pytorch-Aesthetic_1024px_vae_decoder-single_device-inference:
-     status: NEW
+     status: UNSPECIFIED
      required_pcc: 0.95
    ...
    ```
