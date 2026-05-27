@@ -23,6 +23,7 @@ skills/
 ├── failure_summary/                  # YAML digest of all KNOWN_FAILURE_XFAIL entries
 ├── potential_new_models/             # SOTA bringup-candidate suggester
 ├── triage-unpack-forward-output/     # Triage FAILED_FE_COMPILATION "no unpack_forward_output" cases
+├── code-reviewer/                    # C++/Python code review checklist + pre-PR self-review (lint/SPDX/tests/commits)
 └── create-pr/                        # Open a tt-xla PR (area-prefixed title, body template, CODEOWNERS)
 ```
 
@@ -52,6 +53,8 @@ Auxiliary skills hang off the same FSM but enter from different states:
 - `potential_new_models` — suggest the next wave of bringup candidates
 - `triage-unpack-forward-output` — fix one training-test failure pattern
   (`FAILED_FE_COMPILATION` with "no unpack_forward_output handler")
+- `code-reviewer` — review a diff (C++/Python checklist, standards, antipatterns)
+  or run the mechanical pre-PR self-review (lint / SPDX / test coverage / commit messages)
 - `create-pr` — open the PR after `finalize` produces the branch + body draft
 
 ## Consuming tt-foundry from another repo
