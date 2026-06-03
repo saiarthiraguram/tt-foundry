@@ -6,7 +6,10 @@ allowed-tools: Bash Read Write Edit Grep Glob Task Agent
 
 # Model Bringup — Multichip TP (promotion-only)
 
-See `references/` for DRAM budgets, OOM classification, arch eligibility, dtype ladder, and shard templates.
+See `references/` for DRAM budgets, OOM classification, arch eligibility, dtype ladder,
+shard templates, and `pytorch_multichip_tp.md` (PyTorch Megatron TP on multichip hosts).
+
+Scripts: `scripts/compute_weight_fit.py`, `scripts/write_promotion.py`.
 
 ## Entry gate
 

@@ -154,6 +154,17 @@ Before any pytest run, estimate parameter count and write
 `model-bringup-multichip/references/weight_fit_schema.md`. DRAM table:
 `model-bringup-multichip/references/dram_budget_torch_tp.md`.
 
+**Helper script** (preferred when param count is known):
+```bash
+python model-bringup-multichip/scripts/compute_weight_fit.py \
+  --model-key "<model_key>" \
+  --num-params <N> \
+  --hf-repo "<org/repo>" \
+  --param-source loader \
+  --output .claude/bringup/<safe_key>/weight_fit.json
+```
+For pipeline models, add `--component <name>` and `--test-path <pytest node>`.
+
 **Do not hard-reject** large models or route to multichip here — single-device
 bringup always proceeds on eligible arch(es); multichip is promotion-only
 after HW proves weight-bound on every eligible arch.

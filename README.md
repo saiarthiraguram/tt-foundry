@@ -18,7 +18,8 @@ skills/
 ├── model-bringup-config-update/      # CONFIG_UPDATE stage — write final YAML status
 ├── model-bringup-finalize/           # FINALIZE stage — multi-arch reverify, pre-commit, PR draft
 ├── model-bringup-classify-oom/       # Classify activation vs weight-bound OOM (single-chip)
-├── model-bringup-multichip/          # Promotion-only multichip TP orchestrator + references/
+├── model-bringup-write-promotion/    # Write promotion.json after weight-bound exhaustion
+├── model-bringup-multichip/          # Promotion-only multichip TP orchestrator + references/ + scripts/
 ├── model-bringup-scaffold-torch-tp/  # VALIDATE_TP — Megatron shard specs after promotion
 ├── model-bringup-run-torch-tp/       # FIRST_RUN_TP / VERIFY_TP on multichip hosts
 ├── model-bringup-repair-shard-spec/  # REPAIR shard map / mesh for TP
@@ -72,8 +73,12 @@ Auxiliary skills hang off the same FSM but enter from different states:
    weight-bound). PyTorch Megatron TP only; image/video pipeline components are the
    priority validators.
 
-See `skills/model-bringup-multichip/references/` for DRAM tables, OOM classes, and
-shard templates (Mochi / Janus patterns).
+See `skills/model-bringup-multichip/references/` for DRAM tables, OOM classes,
+shard templates (Mochi / Janus patterns), and `pytorch_multichip_tp.md`.
+
+Helper scripts under `skills/model-bringup-multichip/scripts/`:
+- `compute_weight_fit.py` — emit `weight_fit.json` from param count
+- `write_promotion.py` — emit `promotion.json` from `state.arch_results`
 
 ## Consuming tt-foundry from another repo
 

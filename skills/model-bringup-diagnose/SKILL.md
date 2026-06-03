@@ -9,7 +9,41 @@ allowed-tools: Read Bash
 You are the **root cause diagnosis** stage of the model bringup pipeline.
 
 ## Invocation
-`/model-bringup-diagnose <log_path> [--json-report <path>] [--iteration <N>]`
+`/model-bringup-diagnose <log_path> [--json-report <path>] [--iteration <N>] [--arch <n150|p150>]`
+
+When the orchestrator passes `--arch`, stamp it on the diagnosis and pass it
+through to classify-oom.
+
+## Step 0 — OOM classification (before pattern table)
+
+If the log (or JSON report) indicates **OOM** (`DRAM OOM`, `Out of memory`,
+`Killed`, `ResourceExhaustedError`, or runner tag `FAILED_RUNTIME` + OOM text):
+
+1. Invoke **`model-bringup-classify-oom`**:
+   ```
+   /model-bringup-classify-oom --log <log_path> --arch <current_arch> --model-key <key>
+   ```
+2. Read `.claude/bringup/<safe_key>/last_oom_classification.json`.
+3. Merge into diagnosis output under `details.oom_class` and route repair:
+
+| `oom_class` | `suggested_repair_strategy` | Notes |
+|---|---|---|
+| `activation` | `reduce_resolution` (first) or `dtype_bf16_activations` if resolution already reduced | Same arch; orchestrator may retry bf16 after repair |
+| `arch_insufficient` | `none` | Orchestrator **switches arch** (n150→p150); do not repair on n150 |
+| `weight_runtime` | `none` | Record weight_bound; orchestrator continues dtype ladder or next arch |
+| `weight_predicted` | `none` | Scaffold hint only until HW confirms |
+| `shardy_fe`, `fe_pcc` | `escalate` or existing FE strategy | **Not** multichip promotion |
+| `dtype_only` | `dtype_bf16_activations` | Retry bf16 on same arch |
+| `other` | fall through to stdout table | |
+
+4. When classify-oom returns a definitive class (`activation`, `arch_insufficient`,
+   `weight_runtime`, `dtype_only`), set `root_cause_category` to `oom` (or refined
+   `oom_runtime` / `oom_compile` from `last_stage`) and **override** the default
+   `adjust_oom_config` strategy from the table below.
+5. Set `promote_multichip` from classify output only when orchestrator passed
+   `--check-promotion` to classify-oom (all eligible arches exhausted).
+
+Reference: `model-bringup-multichip/references/oom_classification.md`.
 
 ## Responsibility
 Read the pytest log (and structured JSON report if available) and produce a
@@ -78,7 +112,7 @@ Scan the log for these patterns in order (first match wins):
 | Root Cause | Indicators | Default Strategy |
 |---|---|---|
 | `graph_break` | `torch._dynamo.exc.Unsupported`, `graph break`, `Unsupported: ` | `monkey_patch` |
-| `oom` | `DRAM OOM`, `Out of memory`, `Killed`, `ResourceExhaustedError` | `adjust_oom_config` |
+| `oom` | `DRAM OOM`, `Out of memory`, `Killed`, `ResourceExhaustedError` | see **Step 0** (classify-oom); default fallback `adjust_oom_config` only if classify unavailable |
 | `pcc_low` | `PCC=<value> (required=`, `pcc.*FAIL`, `AssertionError.*pcc` | `runtime_debug` (always — set `escalation_skill: "runtime-failure-debugger"`) |
 | `missing_op` | `NotImplementedError`, `not supported by the tt backend`, `Unsupported node: aten.` | `escalate` |
 | `runtime_mismatch` | `shape mismatch`, `RuntimeError.*size`, `Expected.*got.*tensor` | `fix_output_handling` |
@@ -143,7 +177,12 @@ Print the diagnosis as JSON conforming exactly to this schema:
   "suggested_repair_strategy": "<value>",
   "confidence": "high | medium | low",
   "escalation_skill": "runtime-failure-debugger" | null,
-  "last_stage": "FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown"
+  "last_stage": "FE_COMPILATION | TTMLIR_COMPILATION | RUNTIME_EXECUTION | unknown",
+  "details": {
+    "oom_class": "<from classify-oom or null>",
+    "promote_multichip": false,
+    "retry_arch": "<p150 or null>"
+  }
 }
 ```
 

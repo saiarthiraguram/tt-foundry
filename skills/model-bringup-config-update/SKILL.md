@@ -11,6 +11,13 @@ You are the **config update** stage of the model bringup pipeline.
 ## Invocation
 `/model-bringup-config-update <model_key> --result <PASSED|TIMEOUT|ESCALATED> [--arch <arch>] [--apply]`
 
+When the orchestrator finishes the per-arch loop with **at least one passing
+arch**, pass `--result PASSED` once (no per-arch invoke). Read
+`state.arch_results` for the full `supported_archs` list.
+
+For **promotion** (all arches weight-bound), the orchestrator invokes
+`model-bringup-write-promotion` instead — this skill is not used for that path.
+
 ## Responsibility
 Update the test YAML configuration and the test file's `bringup_status`
 marker to reflect the final bringup outcome.
@@ -63,17 +70,32 @@ and stop. The orchestrator records the dry-run path in state.json under
 If `--apply` WAS passed: continue with the per-result branches below.
 
 **If result == PASSED:**
-- Set `bringup_status=BringupStatus.EXPECTED_PASSING` in the test fixture.
-- Ensure the test variant is **not** marked with `pytest.mark.skip`.
-- In the YAML config, add or update the model entry:
-  ```yaml
-  <model_key>:
-    status: EXPECTED_PASSING
-    supported_archs: ["<arch>"]
-    assert_pcc: false  # generative model; set true if PCC is stable
-  ```
-- Update `state.json`: set `stage: "passed"`.
-- Append history entry: `{ "stage": "config_update", "result": "passed" }`.
+
+1. **Resolve `supported_archs` from `state.arch_results`** (preferred over
+   `--arch` alone):
+   ```bash
+   PASSING=$(jq -r '.arch_results | to_entries[] | select(.value == "passed" or .value.result == "passed") | .key' state.json | sort -u | tr '\n' ',' | sed 's/,$//')
+   ```
+   - If `arch_results` is empty, fall back to `--arch` (single-arch debug).
+   - Example: both n150 and p150 passed → `supported_archs: [n150, p150]`.
+   - Example: only p150 passed → `supported_archs: [p150]`.
+2. Set `bringup_status=BringupStatus.EXPECTED_PASSING` in the test fixture.
+3. Ensure the test variant is **not** marked with `pytest.mark.skip`.
+4. In the YAML config, add or update the model entry:
+   ```yaml
+   <model_key>:
+     status: EXPECTED_PASSING
+     supported_archs: [<passing arches from step 1>]
+     assert_pcc: false  # generative model; set true if PCC is stable
+   ```
+5. Update **`weight_fit.json`**: set top-level or per-component
+   `supported_archs` to the same passing list (mirror YAML).
+6. Update `state.json`: set `stage: "passed"`, persist
+   `details.supported_archs: [<list>]`.
+7. Append history entry:
+   `{ "stage": "config_update", "result": "passed", "details": { "supported_archs": [...] } }`.
+
+See `model-bringup-multichip/references/arch_eligibility.md`.
 
 **If result == TIMEOUT:**
 - Set `bringup_status=BringupStatus.UNKNOWN` in the test fixture.

@@ -9,7 +9,33 @@ allowed-tools: Bash Read Write
 You are the **test execution** stage of the model bringup pipeline.
 
 ## Invocation
-`/model-bringup-run <model_key> [--arch <arch>] [--iteration <N>] [--timeout <seconds>]`
+`/model-bringup-run <model_key> [--arch <n150|p150>] [--iteration <N>] [--timeout <seconds>] [--dtype fp32|bf16]`
+
+The orchestrator sets **`state.current_arch`** before each invoke. If present,
+`--arch` must match it (or omit `--arch` and read from state).
+
+## Per-arch, dtype, and test path (orchestrator contract)
+
+1. **Architecture:** `ARCH=$(jq -r '.current_arch // empty' state.json)` or `--arch`.
+   Valid single-chip values: `n150`, `p150`. Always export `TT_XLA_ARCH=$ARCH`.
+2. **Dtype ladder:** Default **`fp32`** on first run for this arch. Use **`bf16`**
+   only when orchestrator passes `--dtype bf16` or
+   `state.details.dtype_ladder[$ARCH] == "bf16"` (after activation repair).
+   Record in history: `"dtype": "fp32" | "bf16"`.
+3. **Log naming (per arch):** use arch-prefixed files so n150 and p150 runs
+   do not overwrite each other:
+   - `logs/iter_<arch>_<N>_run.log` (e.g. `iter_n150_0_run.log`)
+   - `logs/iter_<arch>_<N>_result.json`
+4. **Component / pipeline tests:** if `state.details.test_path` is set (from
+   `weight_fit.json` or scaffold-pipeline), run that node directly instead of
+   `test_all_models_torch` collect:
+   ```bash
+   TT_XLA_ARCH=$ARCH timeout $TIMEOUT_S python -m pytest "$TEST_PATH" ...
+   ```
+5. **Do not** set multichip env here (`TT_VISIBLE_DEVICES`, SPMD) — that is
+   `model-bringup-run-torch-tp` only.
+
+See `model-bringup-multichip/references/dtype_ladder.md`.
 
 ## Responsibility
 Run the pytest test for the given model_key and capture the full output to a log file.
@@ -23,7 +49,7 @@ fallback 900s.
 
 | Pattern (regex on model_key)            | Budget |
 |------------------------------------------|--------|
-| `\b\d+(?:\.\d+)?\s*B(?:[_\-]\|$\|\b)` (N B params) | 1800s if N ≤ 13 else **reject — multi-chip required** |
+| `\b\d+(?:\.\d+)?\s*B(?:[_\-]\|$\|\b)` (N B params) | 1800s (orchestrator may promote to multichip if weight-bound) |
 | `bi_lstm\|hippynn\|mobilenetv3\|\bnano\b\|\d+M` | 300s |
 | `\btiny\b\|\bsmall\b`                     | 600s |
 | `\bbase\b\|resnet50\|resnet101`           | 900s |
@@ -72,10 +98,11 @@ explicit `--timeout` arg). Then:
 
 ```bash
 mkdir -p .claude/bringup/<safe_key>/logs
-ENABLE_BRINGUP_STAGE_LOGGING=1 TT_XLA_ARCH=<arch> timeout $TIMEOUT_S python -m pytest <test_node_ids> \
+LOG_SUFFIX="iter_${ARCH}_${N}"   # e.g. iter_n150_0 — see Per-arch section
+ENABLE_BRINGUP_STAGE_LOGGING=1 TT_XLA_ARCH=$ARCH timeout $TIMEOUT_S python -m pytest <test_node_ids> \
   -svv --tb=long -p no:cacheprovider \
-  --json-report --json-report-file=.claude/bringup/<safe_key>/logs/iter_<N>_result.json \
-  2>&1 | tee .claude/bringup/<safe_key>/logs/iter_<N>_run.log
+  --json-report --json-report-file=.claude/bringup/<safe_key>/logs/${LOG_SUFFIX}_result.json \
+  2>&1 | tee .claude/bringup/<safe_key>/logs/${LOG_SUFFIX}_run.log
 exit_code=${PIPESTATUS[0]}
 ```
 
@@ -248,14 +275,16 @@ If the JSON file is missing (e.g. the test crashed before pytest could
 write it), fall back to stdout summary and record `details.json_report:
 "missing"`.
 
-Append to `history`:
+Append to `history` (include **`arch`** and **`dtype`** on every entry):
 ```json
 {
   "stage": "first_run",
   "timestamp": <now>,
+  "arch": "<n150|p150>",
   "result": "passed" | "failed",
   "details": {
-    "log": "logs/iter_<N>_run.log",
+    "dtype": "fp32" | "bf16",
+    "log": "logs/iter_<arch>_<N>_run.log",
     "json_report": "logs/iter_<N>_result.json",
     "returncode": <int>,
     "duration_seconds": <float>,

@@ -164,8 +164,9 @@ After the arch queue:
 
 - If **any** arch `passed` → CONFIG_UPDATE with `supported_archs` = passing arches
   → FINALIZE → **done** (no multichip).
-- If **all** arches `weight_bound` (none passed) → write **`promotion.json`**
-  (schema: `model-bringup-multichip/references/promotion_schema.md`), set
+- If **all** arches `weight_bound` (none passed) → invoke
+  **`model-bringup-write-promotion`** (writes `promotion.json` via
+  `model-bringup-multichip/scripts/write_promotion.py`), set
   `state.stage = promotion_pending`, print:
   ```
   Single-chip exhausted (weight-bound on: <list>). Next:
