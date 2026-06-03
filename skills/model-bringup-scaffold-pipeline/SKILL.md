@@ -254,62 +254,36 @@ Save `spec` to `scaffold_pipeline.json` under `io_spec`.
 
 ---
 
-## Step 6 — Device target & shard-spec planning
+## Step 6 — Per-component weight_fit (n150 + p150 single-chip)
 
-Ask the user (via `AskUserQuestion`) which target device:
+For **each** component in the Step 2 table, compute `weight_fit` using the
+same rules as `model-bringup-scaffold` Step 4b and
+`model-bringup-multichip/references/dram_budget_torch_tp.md`:
 
-| Option | Aggregate fit (rule of thumb) | TT_VISIBLE_DEVICES default |
-|---|---|---|
-| `n150`           | ≤ 7 B  | `0`                  |
-| `p150`           | ≤ 12 B | `0`                  |
-| `auto`           | based on max(component params)  | derived |
+- **n150** = 12 GiB, **p150** = 32 GiB per device, **85%** weight budget.
+- `activation_class`: `video` if pipeline class matches
+  `Video|I2V|T2V|HunyuanVideo|LTX|Wan|CogVideo|Mochi`; else `image` for
+  diffusion pipelines; `text_encoder` for TE subfolders; `vae` for vae.
 
-Then compute the **chip count** needed:
+Write **one** merged file:
+`.claude/bringup/<safe_key>/weight_fit.json` with `components[]` (see
+`model-bringup-multichip/references/weight_fit_schema.md`).
 
-```python
-def needed_chips(params, device, is_video_gen):
-    # Video-gen activations balloon — derate by 2× on n150, 1.5× on p150.
-    derate = 2.0 if (is_video_gen and device == "n150") else (1.5 if is_video_gen else 1.0)
-    effective = params * derate
-    cap = {"n150": 7_000_000_000, "p150": 12_000_000_000}[device]
-    import math
-    return max(1, math.ceil(effective / cap))
-```
+Per component record:
+- `eligible_archs` — arches where `fits_fp32` or `fits_bf16`
+- `p150_only` — true when only p150 is eligible (Janus Pro-7B pattern)
+- `weight_predicted` per arch — hint for orchestrator, **not** a skip of single-chip
 
-`is_video_gen` is True if the pipeline class name contains
-`Video|I2V|T2V|HunyuanVideo|LTX|Wan|CogVideo`.
+**Single-device first:** do **not** register tensor_parallel YAML here.
+Register **single_device** variant keys per component only (Step 8).
+Multichip TP is **promotion-only** via `/model-bringup-multichip` after
+weight-bound failure on every eligible arch.
 
-Then apply the **uniform-chip-count rule**: if *any* component returns
-`needed_chips > 1`, set the pipeline-wide `chip_count` to that max value,
-and emit shard specs for **every** component (even ones that would fit on
-1). Pipeline demos run all components on the same fabric.
+Optional `promotion_hint` per component in `scaffold_pipeline.json` (mesh
+chip count **estimate only** for humans) — must not auto-run multichip.
 
-Record in `scaffold_pipeline.json`:
-```json
-{
-  "device": "n150",
-  "chip_count": 2,
-  "tt_visible_devices": "0,1",
-  "shard_specs": {
-    "text_encoder":   {"strategy": "data_parallel"},
-    "text_encoder_2": {"strategy": "data_parallel"},
-    "unet":           {"strategy": "tensor_parallel", "mesh": [1, 2]},
-    "vae":            {"strategy": "data_parallel"}
-  }
-}
-```
-
-Shard-spec selection rules:
-- `params < per_device_cap` → `data_parallel` (replicate across chips).
-- `params ≥ per_device_cap` → `tensor_parallel` with mesh shape
-  `[1, chip_count]` (1-D shard, prefer last dim).
-- If user passes `--device auto`, choose the smallest device that fits the
-  largest component without exceeding `chip_count = 1`; only escalate to
-  multi-chip if no single device fits.
-
-If the largest component still does not fit at `chip_count = 8` (the
-fabric max we currently support per host), abort with
-`result=blocked, block_reason="exceeds host fabric capacity"`.
+Copy `eligible_archs` summary into `scaffold_pipeline.json` under
+`components[].weight_fit`.
 
 ---
 
@@ -385,11 +359,12 @@ The runner-side updates needed so component tests actually execute:
      required_pcc: 0.95
    ...
    ```
-2. **Multi-chip variants**: if `chip_count > 1`, the variants live in
-   `test_config_inference_multi_chip.yaml` instead, and `parallelism` in
-   the variant key changes from `single_device` to e.g. `n300` /
-   `tg_8chip` / matching the fabric.
-3. **`TT_VISIBLE_DEVICES` plumbing**: emit a one-line note in the bringup
+2. **Arch-specific markers**: document in component test stubs or README which
+   arches apply (`n150`, `p150`, or both) — align with `weight_fit` per
+   component ([PR #4810](https://github.com/tenstorrent/tt-xla/pull/4810) pattern).
+3. **Multichip YAML**: deferred until `model-bringup-multichip` promotion;
+   do not add `test_config_inference_tensor_parallel` entries at scaffold time.
+4. **`TT_VISIBLE_DEVICES` plumbing**: emit a one-line note in the bringup
    log telling the operator (or downstream model-bringup-run skill) that
    the run must set `TT_VISIBLE_DEVICES=<value>` and reference
    `SHARD_SPECS` from the loader.

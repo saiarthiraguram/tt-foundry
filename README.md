@@ -17,6 +17,12 @@ skills/
 ├── model-bringup-repair/             # REPAIR stage — apply strategy (monkey_patch, runtime_debug, …)
 ├── model-bringup-config-update/      # CONFIG_UPDATE stage — write final YAML status
 ├── model-bringup-finalize/           # FINALIZE stage — multi-arch reverify, pre-commit, PR draft
+├── model-bringup-classify-oom/       # Classify activation vs weight-bound OOM (single-chip)
+├── model-bringup-multichip/          # Promotion-only multichip TP orchestrator + references/
+├── model-bringup-scaffold-torch-tp/  # VALIDATE_TP — Megatron shard specs after promotion
+├── model-bringup-run-torch-tp/       # FIRST_RUN_TP / VERIFY_TP on multichip hosts
+├── model-bringup-repair-shard-spec/  # REPAIR shard map / mesh for TP
+├── model-bringup-config-update-torch-tp/  # CONFIG_UPDATE for tensor_parallel YAML
 ├── runtime-failure-debugger/         # Op-level bisect invoked by runtime_debug repair strategy
 ├── graph-break-analysis/             # Auxiliary: torch.compile graph-break investigation
 ├── model_issue_pick/                 # XFAIL re-triage (single entry)
@@ -56,6 +62,18 @@ Auxiliary skills hang off the same FSM but enter from different states:
 - `code-reviewer` — review a diff (C++/Python checklist, standards, antipatterns)
   or run the mechanical pre-PR self-review (lint / SPDX / test coverage / commit messages)
 - `create-pr` — open the PR after `finalize` produces the branch + body draft
+
+## Single-chip vs multichip (initial v1)
+
+1. **`/model-bringup`** — always single-device first. Per-component `weight_fit.json`
+   plans **n150** (12 GiB) and **p150** (32 GiB); runs **both** arches when both eligible.
+   Dtype ladder: fp32 → activation repair → bf16 on the **same** arch. No multichip from REPAIR.
+2. **`/model-bringup-multichip`** — only after `promotion.json` (all eligible arches
+   weight-bound). PyTorch Megatron TP only; image/video pipeline components are the
+   priority validators.
+
+See `skills/model-bringup-multichip/references/` for DRAM tables, OOM classes, and
+shard templates (Mochi / Janus patterns).
 
 ## Consuming tt-foundry from another repo
 
