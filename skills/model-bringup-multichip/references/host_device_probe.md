@@ -9,8 +9,12 @@
 | **`chips_per_board`** | `runtime_chip_count / visible_board_count` | **2** | **from probe** | Sanity / documentation |
 
 On n300 llmbox: **4 boards × 2 chips/board = 8 runtime chips**.  
-`TT_VISIBLE_DEVICES` enumerates **boards** (0–3), **not** chips (0–7).  
-Using `0,1,2,3,4,5,6,7` fails with: *Valid integer IDs are between 0 and 3*.
+`TT_VISIBLE_DEVICES` enumerates **boards** (0–3), **not** chips (0–7).
+
+**Parser note:** `tt-smi -ls` has two tables — "All available boards" (8 UMD chip
+rows on n300) and "Boards that can be reset" (4 board rows). The probe uses the
+**resettable section only** for `TT_VISIBLE_DEVICES`. Merging both tables produced
+`visible_board_count=12` (Krea bringup, Jun 2026) — fixed in `probe_host.py`.
 
 **Connected board count comes from tt-smi only** — runtime cannot tell you valid
 `TT_VISIBLE_DEVICES` indices.

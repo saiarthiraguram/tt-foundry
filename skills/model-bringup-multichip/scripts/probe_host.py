@@ -96,54 +96,45 @@ def probe_tt_smi_boards() -> dict:
     result["available"] = True
     text = proc.stdout or ""
 
-    # Prefer "Boards that can be reset" section — valid TT_VISIBLE_DEVICES IDs.
-    reset_section = False
+    # Parse each table independently — never merge "all boards" UMD rows with
+    # "resettable" board rows (n300 llmbox: 8 chip rows + 4 board rows → 12 bug).
+    section: str | None = None
     reset_ids: list[int] = []
     all_ids: list[int] = []
     id_re = re.compile(r"^\s*[│|]\s*(\d+)\s+[│|]")
 
     for line in text.splitlines():
-        if "Boards that can be reset" in line:
-            reset_section = True
+        if "All available boards" in line:
+            section = "all"
             continue
-        if reset_section and ("All available boards" in line or line.strip().startswith("┏")):
-            if reset_ids:
-                break
-            reset_section = False
+        if "Boards that can be reset" in line:
+            section = "reset"
+            continue
         m = id_re.match(line.replace("┃", "│"))
-        if not m:
+        if not m or section is None:
             continue
         uid = int(m.group(1))
-        if reset_section:
+        if section == "reset":
             reset_ids.append(uid)
-        elif "All available boards" in text[: text.find(line)] or not reset_ids:
+        else:
             all_ids.append(uid)
 
-    # First table: all UMD IDs before reset section header
-    if not all_ids:
-        in_first = False
-        for line in text.splitlines():
-            if "All available boards" in line:
-                in_first = True
-                continue
-            if in_first and "Boards that can be reset" in line:
-                break
-            m = id_re.match(line.replace("┃", "│"))
-            if m and in_first:
-                all_ids.append(int(m.group(1)))
+    reset_ids = list(dict.fromkeys(reset_ids))
+    all_ids = list(dict.fromkeys(all_ids))
+    result["resettable_umd_ids"] = reset_ids
+    result["all_umd_ids"] = all_ids
 
     if reset_ids:
-        result["resettable_umd_ids"] = reset_ids
         result["visible_board_count"] = len(reset_ids)
+        result["note"] = "resettable board IDs from tt-smi -ls"
     elif all_ids:
-        # Heuristic: unique board pairs on n300 (L+R = 2 UMD rows per board)
-        result["all_umd_ids"] = all_ids
         n = len(all_ids)
         if n == 8:
             result["visible_board_count"] = 4
-            result["note"] = "8 UMD IDs → assume 4 boards (n300 L+R); prefer reset section when present"
+            result["note"] = "8 UMD chip IDs → 4 boards (n300 L+R); no reset section found"
         else:
             result["visible_board_count"] = n
+            result["note"] = f"{n} UMD IDs listed; no reset section found"
 
     return result
 
@@ -174,6 +165,7 @@ def resolve_visible_board_count(runtime: dict, tt_smi: dict) -> tuple[int, str, 
     """Return (visible_board_count, tt_visible_devices string, provenance note)."""
     chip_count = int(runtime.get("runtime_chip_count") or 0)
     tt_smi_n = tt_smi.get("visible_board_count")
+    raw_n = tt_smi_n
 
     if tt_smi_n is not None and tt_smi_n > 0:
         board_count = int(tt_smi_n)
@@ -184,7 +176,6 @@ def resolve_visible_board_count(runtime: dict, tt_smi: dict) -> tuple[int, str, 
     elif chip_count > 1 and chip_count % 2 == 0 and "wormhole" in (
         runtime.get("device_arch") or ""
     ).lower():
-        # n300 llmbox fallback: 2 chips per board
         board_count = chip_count // 2
         prov = (
             f"heuristic: runtime_chip_count={chip_count}, 2 chips/board → "
@@ -193,6 +184,16 @@ def resolve_visible_board_count(runtime: dict, tt_smi: dict) -> tuple[int, str, 
     else:
         board_count = chip_count
         prov = f"fallback: visible_board_count=runtime_chip_count={chip_count}"
+
+    # Sanity: board count cannot exceed chip count (catches merged-table double-count).
+    if chip_count > 0 and board_count > chip_count:
+        corrected = chip_count // 2 if chip_count % 2 == 0 else chip_count
+        prov = (
+            f"corrected visible_board_count {board_count}→{corrected} "
+            f"(boards cannot exceed runtime_chip_count={chip_count}; "
+            f"tt-smi raw={raw_n})"
+        )
+        board_count = corrected
 
     return board_count, visible_devices_for_count(board_count), prov
 
@@ -380,6 +381,8 @@ def classify(runtime: dict, tt_smi: dict) -> dict:
     host["tt_visible_devices_env_valid"] = vis_ok
     host["tt_visible_devices_env_skip_reason"] = vis_reason if not vis_ok else ""
     host["valid_tp_degrees"] = valid_tp_degrees(chips)
+    if tt_smi.get("visible_board_count") != host.get("visible_board_count"):
+        host["visible_board_count_tt_smi_raw"] = tt_smi.get("visible_board_count")
     if not tt_smi.get("available"):
         host["tt_smi_missing"] = True
         host["tt_smi_install_hint"] = tt_smi.get("install_hint") or TT_SMI_INSTALL_HINT
