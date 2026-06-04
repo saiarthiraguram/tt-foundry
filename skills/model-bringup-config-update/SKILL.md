@@ -51,16 +51,32 @@ Provenance:
 
 ## Steps
 
-### 1. Locate the YAML config file
-Check for:
+### 1. Determine test surface (pipeline vs monolithic)
+
+Read `state.json` / `weight_fit.json`:
+
+| `details.scaffold_variant` or `test_path` | Config target |
+|-------------------------------------------|---------------|
+| `"pipeline"` or `test_path` under `tests/torch/models/` | **Component test file only** — do **not** edit runner YAML |
+| Monolithic / `test_all_models_torch[...]` | `test_config_inference_single_device.yaml` |
+
+### 2. Locate bringup_status
+
+**Pipeline components:** `bringup_status=BringupStatus.<value>` in
+`tests/torch/models/<family>/test_*.py` (`record_test_properties` or inline).
+
+**Monolithic:** fixture in `third_party/tt_forge_models/<family>/pytorch/tests/test_*.py`
+or runner-driven test under `tests/runner/`.
+
+### 3. Locate YAML (monolithic only)
+
+If **not** a pipeline component test, check:
 1. `tests/runner/test_config/torch/test_config_inference_single_device.yaml`
-2. Other YAML files under `tests/runner/test_config/` matching the model's run_mode and parallelism.
+2. Other YAML under `tests/runner/test_config/` for run_mode / parallelism.
 
-### 2. Locate the bringup_status in the test fixture
-Find `bringup_status=BringupStatus.<value>` inside the pytest fixture for the model variant
-in `third_party/tt_forge_models/<family>/pytorch/tests/test_*.py`.
+**Skip YAML entirely** when `test_path` matches `tests/torch/models/<family>/`.
 
-### 3. Apply the update (only if `--apply` was passed)
+### 4. Apply the update (only if `--apply` was passed)
 
 If `--apply` was NOT passed: write the proposed-change diff to
 `config_update_proposed.md` per the **Default mode: dry-run** section above
@@ -79,20 +95,29 @@ If `--apply` WAS passed: continue with the per-result branches below.
    - If `arch_results` is empty, fall back to `--arch` (single-arch debug).
    - Example: both n150 and p150 passed → `supported_archs: [n150, p150]`.
    - Example: only p150 passed → `supported_archs: [p150]`.
-2. Set `bringup_status=BringupStatus.EXPECTED_PASSING` in the test fixture.
-3. Ensure the test variant is **not** marked with `pytest.mark.skip`.
-4. In the YAML config, add or update the model entry:
+2. Set `bringup_status=BringupStatus.EXPECTED_PASSING` in the **component test**
+   (pipeline) or monolithic fixture.
+3. Ensure the test is **not** marked with `pytest.mark.skip` (unless documented OOM).
+4. **Pipeline components:** confirm the test already enforces PCC at bringup time:
+   ```python
+   comparison_config=ComparisonConfig(pcc=PccConfig(required_pcc=0.99))
+   ```
+   If missing or below `0.99`, add/fix in the test file — runner YAML `required_pcc`
+   does **not** apply to `tests/torch/models/` nodes. Bringup only counts as PASSED
+   if `model-bringup-run` executed that test and PCC passed.
+5. **Monolithic only:** update YAML:
    ```yaml
    <model_key>:
      status: EXPECTED_PASSING
-     supported_archs: [<passing arches from step 1>]
-     assert_pcc: false  # generative model; set true if PCC is stable
+     supported_archs: [<passing arches>]
+     required_pcc: 0.99
+     assert_pcc: false
    ```
-5. Update **`weight_fit.json`**: set top-level or per-component
+6. Update **`weight_fit.json`**: set top-level or per-component
    `supported_archs` to the same passing list (mirror YAML).
-6. Update `state.json`: set `stage: "passed"`, persist
+7. Update `state.json`: set `stage: "passed"`, persist
    `details.supported_archs: [<list>]`.
-7. Append history entry:
+8. Append history entry:
    `{ "stage": "config_update", "result": "passed", "details": { "supported_archs": [...] } }`.
 
 See `model-bringup-multichip/references/arch_eligibility.md`.

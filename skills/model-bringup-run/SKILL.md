@@ -14,10 +14,35 @@ You are the **test execution** stage of the model bringup pipeline.
 The orchestrator sets **`state.current_arch`** before each invoke. If present,
 `--arch` must match it (or omit `--arch` and read from state).
 
+## Host gate (run before every pytest — FIRST_RUN and VERIFY)
+
+Re-run or read `.claude/bringup/<safe_key>/host_probe.json` (`probe_host.py` if stale).
+See `host_device_probe.md`.
+
+**Single-device components only** (`parallelism_mode: single_device` in `weight_fit.json`):
+
+```bash
+python .../probe_host.py --parallelism-mode single_device -o host_probe.json
+CAN=$(jq -r '.can_run_component // .can_run_single_chip_bringup' host_probe.json)
+if [ "$CAN" != "true" ]; then
+  # Abort: print jq -r '.component_skip_reason // .single_chip_skip_reason'
+  # User must change to dedicated n150/p150 host (runtime_chip_count==1)
+fi
+export TT_XLA_ARCH=$ARCH
+export TT_VISIBLE_DEVICES=0
+```
+
+**Do not** run n150/p150 bringup on n300-llmbox, qb, galaxy, or lb fabric
+(`runtime_chip_count > 1`). On 4-board n300 there is **no n150 single-device** —
+only multichip TP (2/4/8 chips) is valid. **`TT_VISIBLE_DEVICES=0` does not qualify**.
+
+**Multichip** (`tensor_parallel`) uses `model-bringup-run-torch-tp` (separate host gate).
+
 ## Per-arch, dtype, and test path (orchestrator contract)
 
 1. **Architecture:** `ARCH=$(jq -r '.current_arch // empty' state.json)` or `--arch`.
-   Valid single-chip values: `n150`, `p150`. Always export `TT_XLA_ARCH=$ARCH`.
+   Valid single-chip values: `n150`, `p150`. Export `TT_XLA_ARCH=$ARCH` when in arch loop;
+   on multichip-only sessions use probe `inferred_bringup_arch` only for pinned smoke tests.
 2. **Dtype ladder:** Read `details.source_dtype` from scaffold / loader / HF config
    (see `dtype_ladder.md`). Default **`fp32`** when source is fp32-safe. Use **`bf16`**
    when loader `DTYPE`, HF `torch_dtype`, or inference script is bf16-only. Override
@@ -27,14 +52,20 @@ The orchestrator sets **`state.current_arch`** before each invoke. If present,
    do not overwrite each other:
    - `logs/iter_<arch>_<N>_run.log` (e.g. `iter_n150_0_run.log`)
    - `logs/iter_<arch>_<N>_result.json`
-4. **Component / pipeline tests:** if `state.details.test_path` is set (from
-   `weight_fit.json` or scaffold-pipeline), run that node directly instead of
-   `test_all_models_torch` collect:
+4. **Pipeline component tests (required path):** read
+   `weight_fit.json` → `components[].test_path` for the active component
+   (must be under `tests/torch/models/<family>/`). Run that pytest node —
+   **never** rely on `test_config_inference_single_device.yaml` for PCC;
+   the test must use `ComparisonConfig(pcc=PccConfig(required_pcc=0.99))`.
    ```bash
-   TT_XLA_ARCH=$ARCH timeout $TIMEOUT_S python -m pytest "$TEST_PATH" ...
+   TEST_PATH=$(jq -r '.components[] | select(.name=="<component>") | .test_path' weight_fit.json)
+   TT_VISIBLE_DEVICES=0 TT_XLA_ARCH=$ARCH timeout $TIMEOUT_S python -m pytest -svv "$TEST_PATH" ...
    ```
-5. **Do not** set multichip env here (`TT_VISIBLE_DEVICES`, SPMD) — that is
-   `model-bringup-run-torch-tp` only.
+   A PASSED result means PCC **was** evaluated at 0.99 (or whatever the test sets).
+5. **Monolithic / runner collect:** if no `test_path` under `tests/torch/models/`,
+   use `test_all_models_torch[model_key]` collect (grep pattern below).
+6. **Do not** set multichip env here (`TT_VISIBLE_DEVICES`, SPMD) — that is
+   `model-bringup-run-torch-tp` on the `tensor_parallel` test node.
 
 See `model-bringup-multichip/references/dtype_ladder.md`.
 

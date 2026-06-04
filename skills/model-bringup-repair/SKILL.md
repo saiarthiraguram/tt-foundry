@@ -43,7 +43,9 @@ Try strategies in order, stopping when one resolves the OOM:
 ### `reduce_resolution` (activation OOM — same arch)
 
 Use when classify-oom / diagnosis class is **`activation`**. Stay on the
-**current** `TT_XLA_ARCH` (n150 or p150); do not add chips.
+**current** `TT_XLA_ARCH` (n150 or p150); do not add chips. Before VERIFY, re-run
+`probe_host.py` — if `can_run_single_chip_bringup` is false, stop (wrong host; user must
+change machine; do not burn repair iterations on fabric hosts).
 
 1. Switch loader `load_inputs()` to low-res helpers if present (e.g.
    `load_transformer_inputs` vs `load_transformer_inputs_full_res` in Mochi).

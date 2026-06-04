@@ -1,5 +1,31 @@
 # Arch eligibility — n150 and p150 single-chip
 
+## Host probe (current machine)
+
+Before any HW run, use **`host_device_probe.md`** and `scripts/probe_host.py`.
+
+- **n150/p150 bringup (`single_device`):** `runtime_chip_count` must be **1** (dedicated host).
+  Skip on n300-llmbox / qb / galaxy / lb fabric — **no** `TT_VISIBLE_DEVICES=0` workaround.
+- **Multichip TP (`tensor_parallel`):** `runtime_chip_count >= 2`; `TT_VISIBLE_DEVICES` from
+  **tt-smi** resettable boards; mesh from runtime chip count.
+- **n300 llmbox (4 boards, 8 chips):** single-device n150 **cannot run**; multichip only
+  **2, 4, or 8** way TP (`valid_tp_degrees` in probe JSON).
+- **Connected boards:** known via **`tt-smi -ls` only** — not from runtime device count.
+- Install tt-smi if missing: `git clone https://github.com/tenstorrent/tt-smi && cd tt-smi && pip install .`
+- Reset after bad state: `tt-smi -r`
+
+## Component vs host matrix
+
+| Host | `runtime_chip_count` | `single_device` (n150/p150) | `tensor_parallel` |
+|------|----------------------|----------------------------|-------------------|
+| Dedicated n150/p150 | 1 | **Run** | **Skip** — need multichip host |
+| lb-blackhole / qb2 | 4 | **Skip** | **Run** if mesh ∈ {2,4}; `TT_VISIBLE_DEVICES` from tt-smi |
+| n300 llmbox | 8 | **Skip** | **Run** if mesh ∈ {2,4,8}; e.g. `TT_VISIBLE_DEVICES=0,1,2,3` |
+| galaxy-wh-6u | 32 | **Skip** | **Run** if mesh ∈ {2,4,8,32}; meshes `(4,8)` / `(8,4)` — see `host_device_probe.md` |
+
+Orchestrator checks `weight_fit.json` → `parallelism_mode` and probe → `can_run_component`.
+On mismatch: `host_skip`, print `component_skip_reason`, ask user to change machine.
+
 ## Defaults
 
 - **`--archs n150,p150`** when `weight_fit.json` → `eligible_archs` contains both.
@@ -84,15 +110,23 @@ Map device class → bringup arch when documenting skips:
 | `blackhole`             | `p150`                   |
 
 Record per-component eligibility in **`weight_fit.json`** (`eligible_archs`,
-`p150_only`); mirror passing arches into runner YAML when the component is also
-exposed as a `model_key`.
+`p150_only`, `parallelism_mode`). Nightly CI uses **`@pytest.mark.nightly`** +
+`model_test` + `single_device` or `tensor_parallel` — not runner YAML.
+
+Bringup orchestrator **must** probe before run — pytest skip guards are a safety net,
+not a substitute for `host_skip` on wrong SSH session.
 
 ## CONFIG_UPDATE
+
+**Pipeline components:** update `bringup_status` in `tests/torch/models/<family>/`
+and keep `required_pcc=0.99` in the test's `ComparisonConfig`.
+
+**Monolithic `test_models.py` keys only:**
 
 ```yaml
 <model_key>:
   status: EXPECTED_PASSING
-  supported_archs: [n150, p150]   # only arches that passed HW
+  supported_archs: [n150, p150]
 ```
 
 Use `arch_overrides` when one logical model_key needs different status per arch.

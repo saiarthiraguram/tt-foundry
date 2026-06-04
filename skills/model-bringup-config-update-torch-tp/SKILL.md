@@ -10,23 +10,31 @@ allowed-tools: Read Write Edit Bash Grep
 
 `/model-bringup-config-update-torch-tp --result PASSED|ESCALATED [--arch n300-llmbox] [--apply]`
 
-## Target file
+## Target (pipeline vs monolithic)
 
-`tests/runner/test_config/torch/test_config_inference_tensor_parallel.yaml`
+| Surface | On PASSED (--apply) |
+|---------|---------------------|
+| **Pipeline component** (`test_path` under `tests/torch/models/`) | Update sharded test: `@pytest.mark.tensor_parallel`, `bringup_status=EXPECTED_PASSING`, keep `required_pcc=0.99` in `ComparisonConfig`. **No** runner YAML. |
+| **Monolithic** `test_models.py` key | `tests/runner/test_config/torch/test_config_inference_tensor_parallel.yaml` |
 
-## PASSED (--apply)
+## PASSED (--apply) — monolithic YAML only
 
 ```yaml
 <model_key>:
   status: EXPECTED_PASSING
   supported_archs: [<multichip arch>]
-  assert_pcc: false   # generative default; set true when stable
+  assert_pcc: false
 ```
 
-Mirror `bringup_status` in component test file if present.
+## PASSED (--apply) — pipeline component test
+
+Edit `tests/torch/models/<family>/test_<role>.py`:
+- Promote sharded node (`test_*_sharded`) to `BringupStatus.EXPECTED_PASSING`
+- Ensure `@pytest.mark.nightly`, `@pytest.mark.model_test`, `@pytest.mark.tensor_parallel`
+- `ComparisonConfig(pcc=PccConfig(required_pcc=0.99))` must already pass from run-torch-tp
 
 ## Dry-run
 
-Write `.claude/bringup/<safe_key>/config_update_tp_proposed.md` with diff + provenance (tt-xla SHA, promotion.json arch_results).
+Write `.claude/bringup/<safe_key>/config_update_tp_proposed.md` with diff + provenance.
 
-Do not modify single_device YAML entries when promoting — they reflect single-chip attempts.
+Do not add pipeline component entries to runner YAML when promoting TP.
