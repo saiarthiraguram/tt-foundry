@@ -28,9 +28,9 @@ Set `promote_multichip: true` only when `class` is `weight_runtime` or `weight_p
 
 ## arch_insufficient
 
-- Run on `n150` failed DRAM OOM but `weight_fit.json` has `eligible_single_chip.p150 == true`.
+- Run on `n150` failed DRAM OOM but `weight_fit.json` has `eligible_archs` containing `p150` with fits_bf16/fits_fp32.
 - **Not** multichip; continue single-chip on `p150`.
-- Janus Pro-7B ImageToken on n150 is **p150-only** at scaffold time — skip n150 run.
+- Example: component with `"p150_only": true` (large MMGPT / image-token block) — skip n150 in orchestrator; component test may `pytest.skip` when `get_xla_device_arch() == "wormhole"`.
 
 ## weight_predicted
 
@@ -52,4 +52,4 @@ Set `promote_multichip: true` only when `class` is `weight_runtime` or `weight_p
 |---------|----------------|
 | `allocate 32463388672 B DRAM` on video DiT full res | activation (mochi transformer) |
 | `Not enough space to allocate ... across 12 banks` with small weight estimate | activation or arch_insufficient |
-| Pro-7B MMGPT path on n150 only | arch_insufficient → p150 only |
+| Pro-7B-scale MMGPT on n150 only | arch_insufficient → p150 only |

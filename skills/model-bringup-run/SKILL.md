@@ -18,9 +18,10 @@ The orchestrator sets **`state.current_arch`** before each invoke. If present,
 
 1. **Architecture:** `ARCH=$(jq -r '.current_arch // empty' state.json)` or `--arch`.
    Valid single-chip values: `n150`, `p150`. Always export `TT_XLA_ARCH=$ARCH`.
-2. **Dtype ladder:** Default **`fp32`** on first run for this arch. Use **`bf16`**
-   only when orchestrator passes `--dtype bf16` or
-   `state.details.dtype_ladder[$ARCH] == "bf16"` (after activation repair).
+2. **Dtype ladder:** Read `details.source_dtype` from scaffold / loader / HF config
+   (see `dtype_ladder.md`). Default **`fp32`** when source is fp32-safe. Use **`bf16`**
+   when loader `DTYPE`, HF `torch_dtype`, or inference script is bf16-only. Override
+   with `--dtype bf16` or `state.details.dtype_ladder[$ARCH] == "bf16"` after activation repair.
    Record in history: `"dtype": "fp32" | "bf16"`.
 3. **Log naming (per arch):** use arch-prefixed files so n150 and p150 runs
    do not overwrite each other:

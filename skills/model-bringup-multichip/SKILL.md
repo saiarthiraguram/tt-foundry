@@ -1,13 +1,13 @@
 ---
 name: model-bringup-multichip
-description: Promotion-only multichip tensor-parallel bringup for PyTorch models. Runs only after single-chip /model-bringup exhausts n150 and p150 with weight-bound failure. Implements Megatron TP (get_mesh_config + load_shard_spec). Use when promotion.json exists or user explicitly continues from weight_predicted scaffold.
+description: Promotion-only multichip tensor-parallel bringup for PyTorch models. Runs only after single-chip /model-bringup exhausts n150 and p150 with weight-bound failure. Supports Megatron 1D, FSDP-style 2D, and MoE TP patterns (get_mesh_config + load_shard_spec). Use when promotion.json exists or user explicitly continues from weight_predicted scaffold.
 allowed-tools: Bash Read Write Edit Grep Glob Task Agent
 ---
 
 # Model Bringup — Multichip TP (promotion-only)
 
 See `references/` for DRAM budgets, OOM classification, arch eligibility, dtype ladder,
-shard templates, and `pytorch_multichip_tp.md` (PyTorch Megatron TP on multichip hosts).
+shard templates, and `pytorch_multichip_tp.md` (Megatron, FSDP-style, MoE TP).
 
 Scripts: `scripts/compute_weight_fit.py`, `scripts/write_promotion.py`.
 

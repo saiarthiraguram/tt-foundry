@@ -198,7 +198,9 @@ For each arch in `n150`, `p150`:
 ### Persist
 
 1. Write `weight_fit.json` (monolithic: one object; see schema).
-2. Mirror summary in `state.json`:
+2. Record **source dtype** from loader `DTYPE`, HF config, or inference script
+   → `details.source_dtype` in `state.json` (see `dtype_ladder.md`).
+3. Mirror summary in `state.json`:
    - `details.param_estimate`, `details.weight_fit_path`
    - `details.eligible_archs`, `details.weight_predicted_any`
 

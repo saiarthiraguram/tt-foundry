@@ -360,8 +360,9 @@ The runner-side updates needed so component tests actually execute:
    ...
    ```
 2. **Arch-specific markers**: document in component test stubs or README which
-   arches apply (`n150`, `p150`, or both) — align with `weight_fit` per
-   component ([PR #4810](https://github.com/tenstorrent/tt-xla/pull/4810) pattern).
+   `supported_archs` per component from `weight_fit.json` (`eligible_archs` /
+   passing arches after bringup) — **not** `@pytest.mark.n150` / `@pytest.mark.p150`
+   on component tests. See `arch_eligibility.md`.
 3. **Multichip YAML**: deferred until `model-bringup-multichip` promotion;
    do not add `test_config_inference_tensor_parallel` entries at scaffold time.
 4. **`TT_VISIBLE_DEVICES` plumbing**: emit a one-line note in the bringup

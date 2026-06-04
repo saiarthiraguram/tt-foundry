@@ -174,8 +174,8 @@ After the arch queue:
   ```
   Do **not** auto-invoke multichip in the same turn.
 
-Dtype policy: see `model-bringup-multichip/references/dtype_ladder.md` — fp32
-FIRST_RUN per arch before bf16 repairs.
+Dtype policy: see `model-bringup-multichip/references/dtype_ladder.md` — match
+source dtype (bf16 when HF/loader/script uses bf16); fp32-first only when justified.
 
 ## FSM Loop
 Run the following loop (max 5 iterations total across repair cycles) **within each
