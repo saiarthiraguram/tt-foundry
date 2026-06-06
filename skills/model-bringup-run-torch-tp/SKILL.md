@@ -37,6 +37,15 @@ drives mesh only — do not set `0..7` unless `visible_board_count==8`.
 Valid TP on n300 llmbox: **`valid_tp_degrees`** in probe (typically **2, 4, 8** for 8 chips).
 Skip if scaffold `chip_count` is not in that list.
 
+**Head divisibility (DiT / LLM):** if the component has `num_attention_heads`, intersect
+probe degrees with `{d | num_heads % d == 0}`. Document the chosen degree in
+`scaffold_multichip.json` (`head_constraint` field). Do not pick 8-way TP when
+heads=28 (HunyuanImage) — use 4 or 2.
+
+**Large LM text encoders on multichip:** if the test OOMs on replicated logits,
+set `logits_to_keep=1` in loader inputs so lm_head runs on the last token only
+(FLUX.2 Mistral3 TE pattern); hidden states for the pipeline remain full-seq.
+
 ## Test discovery
 
 1. Prefer `state.details.test_path` from weight_fit / component scaffold.

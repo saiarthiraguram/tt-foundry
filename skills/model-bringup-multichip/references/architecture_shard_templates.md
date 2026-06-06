@@ -143,6 +143,14 @@ assuming sharding exists.
 - Attention heads must divide the sharded axis size (Pattern A: `mesh_shape[1]`;
   Pattern B: check head_dim × num_heads vs shard dim).
 - Conv out_channels must divide column-parallel axis for VAE blocks.
+- **Before VALIDATE_TP:** compute valid degrees as powers of 2 dividing
+  `runtime_chip_count` **and** `num_attention_heads % degree == 0`.
+  HunyuanImage 2.1 DiT has **28 heads** → on 8-chip llmbox valid TP is **{2, 4}**
+  only (8-way invalid). Prefer the largest valid degree that fits DRAM.
+- **Stem / conditioning layers:** if a downstream op fixes a dim that does not
+  divide the model axis (e.g. `unflatten(1, (6, dim))` with 6 % tp_degree ≠ 0),
+  **replicate** patch/time/text embeddings and head — shard per-block attn+FF only
+  (Krea CausalWan pattern; see Mochi `shard_transformer_specs`).
 
 ## Tests to copy
 

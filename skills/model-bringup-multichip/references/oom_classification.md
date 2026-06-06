@@ -18,6 +18,12 @@ Set `promote_multichip: true` only when `class` is `weight_runtime` or `weight_p
 - Log mentions intermediate / activation / buffer size >> weight footprint.
 - OOM scales when resolution, `num_frames`, or latent H×W×T changes.
 - `weight_bytes_bf16` fits in `0.7 * DRAM[arch]` for one chip.
+- **Replicated activation peak (multichip):** OOM on a **full-width** intermediate
+  (e.g. seq × 98304 bf16) that stays **replicated** on every chip — weight sharding
+  does not lower the high-water mark. Evidence: per-bank allocated unchanged after
+  shard repair (FLUX.2 transformer on 8-chip llmbox). **Action:** shard the wide
+  intermediate, or `reduce_activation_footprint` (lower seq_len / frames) — not more
+  weight-only row-parallel layers.
 - **Action:** REPAIR on same arch (reduce_resolution, enable_vae_tiling, enable_compile_flags), then dtype_bf16_activations.
 
 ## weight_runtime

@@ -215,6 +215,11 @@ python .../probe_host.py \
 
 After hang or stale device state: **`tt-smi -r`** before re-run.
 
+**Partial llmbox sessions:** some hosts expose fewer resettable boards (e.g.
+`visible_board_count=2` → `TT_VISIBLE_DEVICES=0,1`, `runtime_chip_count=4`).
+Probe is authoritative — do not assume full 4-board / 8-chip unless tt-smi shows it.
+Re-run probe after `tt-smi -r` if chip count changed.
+
 ---
 
 ## Single-chip (unchanged)
