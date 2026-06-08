@@ -1,6 +1,6 @@
 ---
 name: model-bringup-scaffold-pipeline
-description: Scaffold per-component loaders for pipeline models (Stable Diffusion family, video-generation DiTs, any multi-stage HF DiffusionPipeline). Where model-bringup-scaffold writes one loader that returns one model, this skill introspects the pipeline, locates each component's source file, instruments it to capture real I/O shapes/dtypes, then writes a loader where load_model() returns the requested *component* and load_inputs() builds inputs matched to that component's forward signature. Also picks TT_VISIBLE_DEVICES and emits shard specs (uniform across components) based on per-component param counts and the user's target device. Use this skill whenever the HF target is a DiffusionPipeline or any multi-component pipeline — not the default model-bringup-scaffold.
+description: Scaffold per-component loaders AND single-device component tests for pipeline models (Stable Diffusion family, video-generation DiTs, text-to-image MMDiTs, any multi-stage HF DiffusionPipeline). Where model-bringup-scaffold writes one loader that returns one model, this skill enumerates the pipeline's components, captures each component's real I/O shapes/dtypes from one CPU forward, then writes (a) a loader where load_model() returns the requested *component* wrapped to a clean tensors-only forward and load_inputs() builds matched synthetic tensors, and (b) one standalone pytest per component under tests/torch/models/<family>/. It brings each component up on a SINGLE device first — components that fit pass, components that exceed device DRAM are marked xfail with the exact OOM message and a tracking issue — and emits tensor-parallel shard specs for the follow-up multi-chip bringup. Use this skill whenever the HF target is a DiffusionPipeline or any multi-component pipeline — not the default model-bringup-scaffold.
 allowed-tools: Bash Read Write Edit Grep Glob AskUserQuestion
 ---
 
@@ -24,16 +24,41 @@ models break that assumption in three places:
    `pipe.unet`, `pipe.vae`, etc. out themselves. All model-shaping code must
    live in `tt-forge-models`, not in the runner.
 2. **`load_inputs()` for a multi-component pipeline is ambiguous** — inputs to
-   the UNet, VAE encoder, VAE decoder, and text encoder are different shapes
-   and dtypes. A single `load_inputs()` cannot serve all of them.
-3. **Device sizing is per-component, not per-pipeline.** A 7 B aggregate
-   pipeline can still OOM the UNet if its activations are huge (common in
-   video-gen). Shard specs must be chosen so every component runs on the
-   *same* chip count (uniform fabric across a pipeline demo).
+   the UNet/transformer, VAE, and text encoder are different shapes and
+   dtypes, and several components take non-tensor structural args. A single
+   `load_inputs()` cannot serve all of them.
+3. **Device sizing is per-component, not per-pipeline.** A 28 B aggregate
+   pipeline never fits one device, but its individual components might. Bring
+   each component up *independently* on a single device; only the oversized
+   ones need a multi-chip fabric.
 
 This skill scaffolds a loader where each component is a *variant*, with its
-own `load_model()` slice and its own `load_inputs()` builder generated from
-real captured shapes/dtypes — not guessed.
+own `load_model()` slice (wrapped to a tensors-only `forward`) and its own
+`load_inputs()` builder generated from real captured shapes/dtypes — not
+guessed — plus one standalone pytest per component.
+
+---
+
+## Guiding principle — single-device first
+
+**Do not start with multi-chip.** Even when the aggregate pipeline is far too
+big for one device, bring each component up on a single device first. This is
+the convention proven by the Playground v2.5 and Qwen-Image component-test PRs:
+
+- The component that fits (usually the VAE, ~0.1–0.3 B) **passes** on one
+  device — a real, mergeable signal.
+- The components that exceed device DRAM (text encoder, UNet/transformer)
+  **xfail deterministically with an OOM** — captured with the exact
+  `TT_FATAL` message and a tracking issue.
+
+A single-device component-test PR with one pass + a couple of OOM xfails is a
+complete, landable bringup. Tensor-parallel multi-chip is a **follow-up**, not
+a prerequisite — but you still emit `weight_fit.json` and shard specs now
+(Steps 6–7) so the follow-up has everything it needs.
+
+OOM here is a **capacity fact, not a bug**: if a component's weights exceed the
+device's DRAM bank capacity, it OOMs every time. Do not re-run to "confirm" the
+xfail, and do not route it to the runtime debugger — it is a sizing result.
 
 ---
 
@@ -42,10 +67,6 @@ real captured shapes/dtypes — not guessed.
 Before doing any work, verify the HF id resolves to a pipeline class:
 
 ```python
-from diffusers import DiffusionPipeline
-import inspect
-cls = DiffusionPipeline.from_pretrained.__func__
-# Cheap check: list config.json keys — pipelines have _class_name == "<...>Pipeline"
 import json, huggingface_hub
 p = huggingface_hub.hf_hub_download("<hf_repo>", "model_index.json")
 idx = json.load(open(p))
@@ -66,12 +87,13 @@ detection should be loud, not silent.
 ## Step 1 — Parse model_key / hf_repo
 
 Accept either:
-- A bare HF repo id (`playgroundai/playground-v2.5-1024px-aesthetic`)
+- A bare HF repo id (`Qwen/Qwen-Image`, `playgroundai/playground-v2.5-1024px-aesthetic`)
 - A structured `model_key` (`playground_v2_5/pytorch-Aesthetic_1024px-single_device-inference`)
 
 Derive `family` from the repo slug (lowercased, non-alnum → `_`), e.g.
-`playground-v2.5-1024px-aesthetic` → `playground_v2_5_1024px_aesthetic`.
-Truncate to a reasonable length (≤ 40 chars).
+`Qwen-Image` → `qwen_image`. Truncate to a reasonable length (≤ 40 chars).
+Prefer the short, human-recognizable family name (`qwen_image`, not
+`qwen_qwen_image`).
 
 Persist the chosen `family`, `variant_prefix` (the human-readable variant
 stem before the per-component suffix), and `hf_repo` in
@@ -88,13 +110,13 @@ possible.
 
 ```python
 from huggingface_hub import hf_hub_download
-import json, importlib, diffusers
+import json
 idx = json.load(open(hf_hub_download("<hf_repo>", "model_index.json")))
 
 components = {}              # name -> {class_name, params_estimate, source_file}
 for name, spec in idx.items():
     if name.startswith("_") or not isinstance(spec, list): continue
-    module_name, class_name = spec   # e.g. ["diffusers", "UNet2DConditionModel"]
+    module_name, class_name = spec   # e.g. ["diffusers", "QwenImageTransformer2DModel"]
     try:
         cfg = json.load(open(hf_hub_download("<hf_repo>", f"{name}/config.json")))
     except Exception:
@@ -104,35 +126,24 @@ for name, spec in idx.items():
 
 For each component, compute an approximate parameter count:
 
-- **UNet / transformer (DiT)**: `hidden_size² × num_layers × C` heuristic
-  using `cfg`'s `block_out_channels`, `num_attention_heads`, `cross_attention_dim`,
-  `transformer_layers_per_block`. If a `num_parameters` field is present in
-  the config (newer DiT releases include it), prefer that.
-- **VAE**: usually ~80 M; if `cfg.block_out_channels` and `layers_per_block`
-  present, use a coarse scaling.
+- **UNet / transformer (DiT/MMDiT)**: prefer a `num_parameters` field if the
+  config carries one; otherwise scale from `hidden_size`/`num_attention_heads`
+  × `num_layers`. A 60-block MMDiT at hidden 3072+ is ~20 B — size it before
+  you plan, because it dictates the chip count.
+- **VAE**: usually ~0.1–0.3 B; coarse scaling from `block_out_channels` /
+  `layers_per_block` is fine.
 - **Text encoder(s)**: `AutoConfig.from_pretrained("<repo>", subfolder="text_encoder")`
-  → use `hidden_size² × num_hidden_layers × 12` as the standard transformer
-  estimate.
-- **Scheduler / safety_checker / feature_extractor**: skip — no parameters
-  to compile.
+  → `hidden_size² × num_hidden_layers × 12`. Note: a text encoder can itself
+  be a large VLM (Qwen-Image's is Qwen2.5-VL 7B) — do not assume "text encoder"
+  means "small."
+- **Scheduler / safety_checker / feature_extractor / tokenizer**: skip — no
+  parameters to compile.
 
 Fallback: name-based heuristic from `failure_summary` (`\d+B`/`\d+M` regex,
-size words like `tiny`/`small`/`base`/`large`/`xl`). The fallback applies
-*per component*, not to the aggregate pipeline.
+size words). The fallback applies *per component*, not to the aggregate.
 
-Save the enumeration as a table in `scaffold_pipeline.json`:
-```json
-{
-  "components": [
-    {"name": "text_encoder",   "class": "CLIPTextModel",                 "params": 123_000_000, "source": "transformers/models/clip/modeling_clip.py"},
-    {"name": "text_encoder_2", "class": "CLIPTextModelWithProjection",   "params": 695_000_000, "source": "transformers/models/clip/modeling_clip.py"},
-    {"name": "unet",           "class": "UNet2DConditionModel",          "params": 2_600_000_000, "source": "diffusers/models/unets/unet_2d_condition.py"},
-    {"name": "vae",            "class": "AutoencoderKL",                 "params": 84_000_000, "source": "diffusers/models/autoencoders/autoencoder_kl.py"}
-  ],
-  "total_params": 3_500_000_000,
-  "denoising_steps_default": 50
-}
-```
+Save the enumeration as a table in `scaffold_pipeline.json` (`components`,
+`total_params`, `denoising_steps_default`).
 
 ---
 
@@ -148,109 +159,85 @@ cls = getattr(mod, class_name)
 src = inspect.getsourcefile(cls)
 ```
 
-Record `source_file` in `scaffold_pipeline.json` (absolute path, plus a
-repo-relative form). If `inspect.getsourcefile` returns `None` (rare:
-class is defined in a `.pyc`-only or zipimported module), fall back to
-`importlib.import_module(module_name).__file__` and grep within that file
-or its package for `class <class_name>(`.
-
-Schedulers and feature extractors are intentionally skipped here.
+Record `source_file` in `scaffold_pipeline.json`. If `inspect.getsourcefile`
+returns `None`, fall back to `mod.__file__` and grep for `class <class_name>(`.
+Schedulers / tokenizers / feature extractors are intentionally skipped.
 
 ---
 
 ## Step 4 — Insert logging instrumentation (offline capture only)
 
-Goal: capture the **real** input/output tensor shapes, dtypes, and (where
-small) tensor contents for every component on one forward pass of the
-pipeline. This is what step 5's `load_inputs()` builders consume.
+Goal: capture the **real** input/output tensor shapes and dtypes for every
+component on one forward pass. This is what step 5's `load_inputs()` builders
+consume.
 
-For every component's source file:
+For huge pipelines, prefer a **per-component monkey-patch** over copying source
+files: wrap each component's `forward` (and the VAE's `decode`) on the loaded
+class object to log args before delegating, e.g.
 
-1. Locate the `forward(self, ...)` method via `ast.parse` (do not regex —
-   `forward` can be deep inside the class). Record the original line range.
-2. Inject at the **first body line**:
-   ```python
-   import logging; _BR_LOG = logging.getLogger("tt_bringup.<component>")
-   _BR_LOG.info(
-       "FWD_IN class=%s shapes=%s dtypes=%s",
-       type(self).__name__,
-       {k: tuple(v.shape) for k, v in locals().items() if hasattr(v, "shape")},
-       {k: str(v.dtype) for k, v in locals().items() if hasattr(v, "dtype")},
-   )
-   ```
-3. Inject just before every `return` in `forward`:
-   ```python
-   _BR_LOG.info("FWD_OUT class=%s out=%r", type(self).__name__,
-       <expr summarising the return value's shapes/dtypes>)
-   ```
-4. For the **denoising loop** specifically (pipelines expose this on the
-   pipeline class itself, usually inside `__call__` — look for the
-   `for i, t in enumerate(timesteps)` or `for t in self.progress_bar(...)`
-   loop), inject `_BR_LOG.info("DENOISE_STEP %d/%d", i, len(timesteps))`.
+```python
+def _probe(orig, tag):
+    def wrapped(self, *a, **kw):
+        named = {**{f"arg{i}": v for i, v in enumerate(a)}, **kw}
+        shapes = {k: tuple(v.shape) for k, v in named.items() if hasattr(v, "shape")}
+        dtypes = {k: str(v.dtype) for k, v in named.items() if hasattr(v, "dtype")}
+        nonten = {k: v for k, v in named.items() if not hasattr(v, "shape")}
+        _BR_LOG.info("FWD_IN %s shapes=%s dtypes=%s nontensor=%s", tag, shapes, dtypes, nonten)
+        out = orig(self, *a, **kw)
+        return out
+    return wrapped
+```
 
-**Critical**: these edits go into a **temporary venv overlay**, not the
-installed `diffusers` / `transformers` packages. Either:
+**Capture the non-tensor structural args too** (`img_shapes`, `txt_seq_lens`,
+`guidance`, `added_cond_kwargs` dict fields, `return_dict`). These are the args
+the wrapper in Step 8 must *pin* — if you only log tensor shapes you will not
+know what to hardcode and the wrapper's `forward` will be wrong.
 
-- Copy the source files into `.claude/bringup/<safe_key>/_overlay/<pkg>/<...>.py`
-  and prepend the overlay path to `PYTHONPATH` for the capture run only, **or**
-- Use `inspect.getsource` + `exec` with monkey-patched `forward` methods on
-  the loaded class objects.
-
-Do **not** mutate the installed-package source files — that contaminates
-other tests and other models on the same machine. Always restore on exit
-(write a cleanup hook in the capture script).
-
-Persist the chosen instrumentation strategy in `scaffold_pipeline.json`
-under `capture.strategy`.
+**Critical:** never mutate the installed `diffusers` / `transformers` source
+tree — that contaminates every other test on the machine. Monkey-patch on the
+loaded class objects (auto-reverts when the process exits), or use a
+`PYTHONPATH` overlay you delete afterward. Persist the strategy in
+`scaffold_pipeline.json` under `capture.strategy`.
 
 ---
 
 ## Step 5 — Run one tiny pipeline pass and harvest
 
 Run the pipeline **once** with minimal inputs (lowest resolution, batch=1,
-num_inference_steps=2) under the overlay from step 4, with logging routed
-to `.claude/bringup/<safe_key>/capture.log`:
+`num_inference_steps=2`) on CPU, logging to
+`.claude/bringup/<safe_key>/capture.log`:
 
 ```bash
-DIFFUSERS_VERBOSITY=info \
-PYTHONPATH=.claude/bringup/<safe_key>/_overlay:$PYTHONPATH \
 python - <<'PY'
 import logging, torch
 from diffusers import DiffusionPipeline
 logging.basicConfig(level=logging.INFO)
 pipe = DiffusionPipeline.from_pretrained("<hf_repo>", torch_dtype=torch.bfloat16)
 pipe.to("cpu")  # we only need shapes; do not waste a TT card on this
+# ... install monkey-patches from Step 4 here ...
 out = pipe("a small red cube on a wooden table",
-           num_inference_steps=2, height=64, width=64)
+           num_inference_steps=2, height=256, width=256)
 PY
 ```
 
-Parse `capture.log` and produce a per-component **I/O spec** dict:
+**Slow-VAE escape hatch.** The VAE *decode* on a full-res latent can take many
+minutes on CPU and you do not need it to finish — once the text-encoder and
+transformer/UNet `FWD_IN` lines are logged, the run can bail. The VAE's input
+shape is fully determined by the latent channel count and the
+height/width/8 (and temporal dim for video/3D VAEs), so derive it analytically
+rather than waiting for the decode. Record in the log which components were
+captured live vs. derived (Qwen-Image's `capture_v2` bailed before the slow
+decode and derived the VAE latent shape `[1,16,1,32,32]` from config).
 
-```python
-spec = {
-  "unet": {
-    "inputs": [
-      {"name": "sample",            "shape": (1, 4, 8, 8), "dtype": "torch.bfloat16"},
-      {"name": "timestep",          "shape": (1,),         "dtype": "torch.int64"},
-      {"name": "encoder_hidden_states", "shape": (1, 77, 2048), "dtype": "torch.bfloat16"},
-      {"name": "added_cond_kwargs", "kind": "dict", "fields": {
-         "text_embeds": {"shape": (1, 1280), "dtype": "torch.bfloat16"},
-         "time_ids":    {"shape": (1, 6),    "dtype": "torch.bfloat16"}}}
-    ],
-    "outputs": [{"shape": (1, 4, 8, 8), "dtype": "torch.bfloat16"}],
-    "called_per_step": True
-  },
-  ...
-}
-```
+Parse `capture.log` into a per-component **I/O spec** dict and record:
+- tensor inputs (name, shape, dtype),
+- **non-tensor inputs** (the pinned structural args, with their literal values),
+- outputs (shape, dtype),
+- `denoise_steps_observed`,
+- whether each component is called once per pipeline call or once per step.
 
-Also record:
-- `denoise_steps_observed`: the iteration count printed by the loop probe.
-- Whether each component is called **once per pipeline call** or **once per
-  denoise step** (callees-per-step distinction matters for perf budgeting).
-
-Save `spec` to `scaffold_pipeline.json` under `io_spec`.
+Save `spec` to `scaffold_pipeline.json` under `io_spec`, and also dump the raw
+parsed values to `io_spec_raw.json` for auditability.
 
 ---
 
@@ -276,15 +263,16 @@ Per component record:
 - **`parallelism_mode`** — **`single_device`** or **`tensor_parallel`** (per
   component, not one choice for the whole pipeline). Decide from weight_fit:
   - **`single_device`**: bf16 weights fit on one chip on at least one eligible
-    arch → component test uses `@pytest.mark.single_device`; bringup runs
+    arch → `@pytest.mark.single_device`; bringup runs
     `tests/torch/models/<family>/test_<role>.py` (unsharded path).
   - **`tensor_parallel`**: weight-bound on every eligible single-chip arch →
     scaffold a sharded test (e.g. `test_transformer_sharded`) and/or promote
-    later via `/model-bringup-multichip`; test uses `@pytest.mark.tensor_parallel`
-    when CI should run the sharded node (Krea/Mochi/Wan pattern).
+    later via `/model-bringup-multichip`; `@pytest.mark.tensor_parallel` on the
+    sharded node (Krea/Mochi/Wan pattern).
 - **`single_device_only`**: true when `parallelism_mode == single_device` and
   the component must **never** be the primary TP promotion target (encoders, VAE).
   On a multichip mesh for a sibling DiT, replicate only (`load_shard_spec` → `None`).
+- **`test_path`** — exact pytest node for `model-bringup-run` (mandatory).
 
 **Do not** pick one parallelism mode for the entire pipeline — text_encoder may
 be `single_device` while transformer is `tensor_parallel` on the same family.
@@ -300,10 +288,50 @@ Copy `eligible_archs` summary into `scaffold_pipeline.json` under
 
 ---
 
-## Step 7 — Write the per-component loader
+## Step 7 — Device target & shard-spec planning (for the multi-chip follow-up)
 
-Directory layout (same as `model-bringup-scaffold`, with one variant
-*per component*):
+Even though Step 9 tests on a single device first, compute and record the
+multi-chip plan now so the follow-up bringup is ready.
+
+Ask the user (via `AskUserQuestion`) which target device (n150 ~7 B/chip,
+p150 ~12 B/chip, or `auto`). Then compute the **chip count** per component:
+
+```python
+def needed_chips(params, device, is_video_gen):
+    derate = 2.0 if (is_video_gen and device == "n150") else (1.5 if is_video_gen else 1.0)
+    effective = params * derate
+    cap = {"n150": 7_000_000_000, "p150": 12_000_000_000}[device]
+    import math
+    return max(1, math.ceil(effective / cap))
+```
+
+`is_video_gen` is True if the pipeline class name contains
+`Video|I2V|T2V|HunyuanVideo|LTX|Wan|CogVideo|Mochi`.
+
+Apply the **uniform-chip-count rule** for the *fabric demo*: if any component
+needs N chips, the pipeline-wide `chip_count` is that max (this is the **mesh /
+runtime chip count** for SPMD), and you emit shard specs for every component.
+Record `device`, `chip_count`, and `shard_specs` in `scaffold_pipeline.json`.
+Shard-spec rules:
+- `params < per_device_cap` → `data_parallel`.
+- `params ≥ per_device_cap` → `tensor_parallel`, mesh `[1, chip_count]`.
+
+**`TT_VISIBLE_DEVICES` is NOT `chip_count`.** Do not set `0..N-1` from
+`chip_count` alone. At run time, **`probe_host.py`** reads **tt-smi -ls**
+resettable **board** count (`visible_board_count`) — e.g. n300 llmbox with
+8 runtime chips → `0,1,2,3` (4 boards), not `0..7`. See `host_device_probe.md`.
+Record only a placeholder note in scaffold JSON if needed; the orchestrator
+and `model-bringup-run-torch-tp` always export from `host_probe.json`.
+
+If the largest component does not fit at `chip_count = 8`, note
+`block_reason="exceeds host fabric capacity"` for the multi-chip path — but
+still scaffold the single-device tests (the OOM xfail is itself the record).
+
+---
+
+## Step 8 — Write the per-component loader (direct load + wrapper)
+
+Directory layout (one variant *per component*):
 
 ```
 third_party/tt_forge_models/<family>/
@@ -315,214 +343,249 @@ third_party/tt_forge_models/<family>/
 
 `loader.py` must:
 
-1. Define `ModelVariant(StrEnum)` with one entry per component variant.
-   Variant names follow `<VariantPrefix>_<Component>`, e.g.
-   `AESTHETIC_1024PX_UNET`, `AESTHETIC_1024PX_VAE_DECODER`,
-   `AESTHETIC_1024PX_TEXT_ENCODER`. Keep them stable — component tests
-   under `tests/torch/models/<family>/` import these variants.
-2. `_VARIANTS` maps each variant to a `ModelConfig(pretrained_model_name=<repo>)`
-   plus a `subfolder` (the HF model_index.json key — `"unet"`, `"vae"`,
-   `"text_encoder"`, etc.).
-3. `ModelLoader.__init__` stores `self.component_name = variant_config.subfolder`
-   so `load_model()` and `load_inputs()` can branch on it.
-4. `load_model()` returns **only the requested component**:
+1. **Embed the captured I/O spec** as a Python literal near the top
+   (`_COMPONENT_IO_SPEC = {...}`) plus the shape constants, so the loader is
+   self-contained and reproducible without re-running capture. Embed
+   `SHARD_SPECS` from Step 7. Do **not** hardcode `TT_VISIBLE_DEVICES` in the
+   loader — resolve at run time from `probe_host.py` / tt-smi (see Step 7).
+
+2. **Never load the whole pipeline.** Fetch each component *directly* via its
+   own class + `subfolder=` — loading a 28 B `DiffusionPipeline` just to pull
+   one component will OOM host RAM:
    ```python
-   from diffusers import DiffusionPipeline
-   pipe = DiffusionPipeline.from_pretrained(repo, torch_dtype=dtype)
-   self._component = getattr(pipe, self.component_name)
-   return self._component
+   # GOOD — direct, one component into RAM:
+   from diffusers import QwenImageTransformer2DModel
+   transformer = QwenImageTransformer2DModel.from_pretrained(
+       repo, subfolder="transformer", torch_dtype=dtype)
+
+   # BAD — pulls every component into RAM first:
+   # pipe = DiffusionPipeline.from_pretrained(repo); m = pipe.transformer
    ```
-   Free `pipe` after extraction (`del pipe`) so we do not hold every
-   component in RAM.
-5. `load_inputs()` reads the per-component spec from step 5 and synthesizes
-   matching tensors with `torch.randn(shape, dtype=...)` (or
-   `torch.randint` for integer dtypes like timestep). For dict-valued
-   inputs (`added_cond_kwargs`), build the nested dict explicitly.
-   **Do not** call the pipeline to derive inputs — that defeats the
-   purpose of synthetic inputs.
-6. `unpack_forward_output()` matches the output spec from step 5.
 
-Embed the captured I/O spec as a Python literal at the top of the loader
-under `_COMPONENT_IO_SPEC = { ... }` so the loader is self-contained and
-reproducible without re-running capture.
+3. **Wrap each component in a thin `nn.Module`** that exposes a *tensors-only*
+   `forward`. This is where you (a) pin the non-tensor structural args captured
+   in Step 5, (b) select the right callable (some components decode, not
+   forward), and (c) unwrap complex output objects to a bare tensor so the
+   runner's `run_graph_test` needs no `unpack_forward_output`:
+   ```python
+   class _QwenImageTransformerWrapper(torch.nn.Module):
+       def __init__(self, transformer):
+           super().__init__(); self.transformer = transformer
+       def forward(self, hidden_states, timestep,
+                   encoder_hidden_states, encoder_hidden_states_mask):
+           out = self.transformer(
+               hidden_states=hidden_states, timestep=timestep, guidance=None,
+               encoder_hidden_states=encoder_hidden_states,
+               encoder_hidden_states_mask=encoder_hidden_states_mask,
+               img_shapes=TR_IMG_SHAPES, txt_seq_lens=TR_TXT_SEQ_LENS,  # PINNED
+               return_dict=False)
+           return out[0]
 
-The same shard-spec dict from step 6 is also embedded near the top, so
-the runner can read it without re-deriving:
-```python
-SHARD_SPECS = { "unet": {...}, "vae": {...}, ... }
-TT_VISIBLE_DEVICES = "0,1"
-```
+   class _QwenTextEncoderWrapper(torch.nn.Module):     # VLM text encoder
+       def forward(self, input_ids, attention_mask):
+           out = self.text_encoder(input_ids=input_ids,
+                                   attention_mask=attention_mask,
+                                   output_hidden_states=True)
+           return out.hidden_states[-1]                # unwrap to a tensor
+
+   class _QwenVAEDecoderWrapper(torch.nn.Module):      # decode, not forward
+       def forward(self, latent):
+           return self.vae.decode(latent, return_dict=False)[0]
+   ```
+   The wrapper is the contract: the test feeds only tensors, the runner traces
+   a clean graph, and all the pipeline-specific plumbing stays in the loader.
+
+4. **`ModelVariant(StrEnum)`** with one entry per component
+   (`<Prefix>_TextEncoder`, `<Prefix>_Transformer`, `<Prefix>_Vae`). Keep them
+   stable — the test files import them by name. `_VARIANTS` maps each to a
+   `ModelConfig(pretrained_model_name=<repo>)` plus `subfolder` (the HF
+   `model_index.json` key). `DEFAULT_VARIANT` should be the headline component
+   (the transformer/UNet).
+
+5. **`load_model(dtype_override=...)`** branches on `self._variant`, does the
+   direct `from_pretrained(..., subfolder=...)`, calls `.eval()`, and returns
+   the wrapped module.
+
+6. **`load_inputs(dtype_override=..., batch_size=1)`** synthesizes tensors at
+   the captured shapes with `torch.randn` (float dtypes) / `torch.randint`
+   (int dtypes like `input_ids`, masks, timesteps). Return them **as a list in
+   the wrapper's `forward` arg order**. Do **not** call the pipeline to derive
+   inputs — that breaks component isolation.
+
+Run `model-bringup-overview`-style sanity: import the loader, resolve each
+variant, and confirm `load_inputs()` shapes match `_COMPONENT_IO_SPEC`.
 
 ---
 
-## Step 8 — Scaffold component tests (`tests/torch/models/`)
+## Step 9 — Write standalone single-device component tests
 
-Pipeline components are **not** registered in
-`tests/runner/test_config/torch/test_config_inference_single_device.yaml`.
-That file is for **`test_models.py` collect** (monolithic `family/pytorch-Variant-*`
-keys). Hunyuan, Krea, Mochi, Wan, Janus, etc. use **`tests/torch/models/<family>/`**
-and nightly CI selects them via **pytest markers**, not runner YAML.
-
-For **each** component, create or extend under `tests/torch/models/<family>/`:
+This is the current convention (Playground v2.5, SDXL-Lightning, Qwen-Image,
+Krea, HunyuanImage): one pytest **file per component** under
+`tests/torch/models/<family>/`, each driving `run_graph_test`. This is **not**
+the YAML-runner path — pipeline component bringups use test files.
 
 ```
 tests/torch/models/<family>/
-  test_text_encoder.py
-  test_transformer.py      # may include test_transformer + test_transformer_sharded
-  test_vae_decoder.py
-  ...
+├── __init__.py                 # SPDX header only
+├── test_text_encoder.py
+├── test_transformer.py   (or test_unet.py; may add test_transformer_sharded)
+└── test_vae_decoder.py
 ```
 
-1. **Test path (mandatory in `weight_fit.json`)** — store the exact node bringup runs:
-   ```
-   tests/torch/models/<family>/test_transformer.py::test_transformer
-   tests/torch/models/<family>/test_transformer.py::test_transformer_sharded
-   ```
-   Set `state.details.test_path` to the node matching `parallelism_mode`.
+Each test file follows this shape (add markers per `weight_fit.json`):
 
-2. **CI markers** (required on the test function CI should run):
-   ```python
-   @pytest.mark.nightly
-   @pytest.mark.model_test
-   @pytest.mark.single_device   # when parallelism_mode == single_device
-   # OR
-   @pytest.mark.tensor_parallel # when parallelism_mode == tensor_parallel (sharded node)
-   ```
-   Optional: `@pytest.mark.large` for very heavy DiT. See `pytest.ini`.
+```python
+# SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
 
-3. **PCC 0.99 in the test (mandatory, enforced at run time)** — do **not** put
-   `required_pcc` in runner YAML for pipeline components. Enforce in the test body:
-   ```python
-   from infra.evaluators import ComparisonConfig, PccConfig
+"""<Model> — <Class> (<component>) component test."""
 
-   run_graph_test(
-       ...,
-       comparison_config=ComparisonConfig(pcc=PccConfig(required_pcc=0.99)),
-   )
-   ```
-   Or fixture + `record_test_properties(..., pcc=0.99)` (Mochi-style) wired into
-   `ComparisonConfig`. **`model-bringup-run` must execute this test node** so PCC
-   is actually checked — a scaffold that only writes YAML at `0.95` does **not**
-   test anything (that was a doc mistake copied from playground **runner** examples).
+import pytest
+import torch
+import torch_xla
+import torch_xla.runtime as xr
+from infra import Framework, run_graph_test
+from infra.evaluators import ComparisonConfig, PccConfig
 
-4. **`bringup_status`**: start as `BringupStatus.UNSPECIFIED` in
-   `record_test_properties` (or omit until first run). `model-bringup-config-update`
-   sets `BringupStatus.EXPECTED_PASSING` on PASSED **in the test file**, not YAML.
+from third_party.tt_forge_models.<family>.pytorch import ModelLoader, ModelVariant
 
-5. **Arch guards**: use runtime skip from `weight_fit` (`p150_only`) — **not**
-   `@pytest.mark.n150` / `@pytest.mark.p150`. See `arch_eligibility.md`.
 
-6. **Do not add** `test_config_inference_single_device.yaml` or
-   `test_config_inference_tensor_parallel.yaml` entries for pipeline component
-   tests unless the family also has a monolithic `test_models.py` variant.
+@pytest.mark.nightly
+@pytest.mark.model_test
+@pytest.mark.single_device   # or @pytest.mark.tensor_parallel for sharded node
+def test_<component>():
+    xr.set_device_type("TT")
+    torch.manual_seed(42)
 
-7. **`TT_VISIBLE_DEVICES`**: board IDs from **`tt-smi -ls`** at run time via `probe_host.py`
-   (`visible_board_count`); mesh size from **`runtime_chip_count`** (XLA). These differ on
-   n300 llmbox (e.g. `TT_VISIBLE_DEVICES=0,1,2,3`, mesh 8 chips).
-8. **`host_probe`**: every `/model-bringup` and `/model-bringup-multichip` run probes with
-   `--parallelism-mode` from the active component. Single-device only on `runtime_chip_count==1`;
-   TP only on 2+ chips with mesh in `valid_tp_degrees` (2/4/8 on n300). Skip and prompt user
-   to change host when mismatch (e.g. VAE `single_device` on llmbox). See `host_device_probe.md`.
-   Install tt-smi if missing; `tt-smi -r` resets boards.
+    loader = ModelLoader(ModelVariant.<COMPONENT>)
+    model = loader.load_model(dtype_override=torch.float32)
+    inputs = loader.load_inputs(dtype_override=torch.float32)
+
+    run_graph_test(
+        model,
+        inputs,
+        framework=Framework.TORCH,
+        comparison_config=ComparisonConfig(pcc=PccConfig(required_pcc=0.99)),
+    )
+```
+
+Additional rules:
+1. **Test path** — store the exact node in `weight_fit.json` → `test_path`;
+   `model-bringup-run` executes that node (not runner YAML collect).
+2. **PCC 0.99** — enforce in the test via `ComparisonConfig`, not runner YAML.
+3. **Arch guards** — runtime skip from `weight_fit` (`p150_only`); see
+   `arch_eligibility.md`. Do **not** use `@pytest.mark.n150` / `@pytest.mark.p150`.
+4. **Do not add** `test_config_inference_single_device.yaml` entries for pipeline
+   component tests unless the family also has a monolithic `test_models.py` key.
+5. **Host routing** — before HW, `probe_host.py` with `--parallelism-mode` from
+   `weight_fit.json`. **`TT_VISIBLE_DEVICES`** from tt-smi boards
+   (`visible_board_count`); mesh from **`runtime_chip_count`**. On n300 llmbox:
+   `0,1,2,3` for 8 chips — never derive VIS from chip count. See
+   `host_device_probe.md`. Install tt-smi if missing; `tt-smi -r` resets boards.
+
+Notes:
+- Tests run **fp32** (`dtype_override=torch.float32`) even though the loader
+  default is bf16 — `run_graph_test` compares against an fp32 CPU golden.
+- `inputs` is the **list** `load_inputs` returns, in the wrapper's arg order.
+- Confirm the files **collect** (`pytest --collect-only`) before running on HW.
+
+Then **run each component on a single device** (delegated to
+`model-bringup-run`, or directly with a generous timeout — large weight
+downloads + compile can take 10–70 min). Set `IRD_LF_CACHE` for IRD-backed
+models. Per outcome:
+
+- **Passes** → leave the plain `@nightly` + `@model_test` markers.
+- **OOMs** (the big components, by design) → add `@pytest.mark.xfail` *above*
+  the existing markers, with the **exact** `TT_FATAL` message and a tracking
+  issue:
+  ```python
+  @pytest.mark.xfail(
+      reason="Out of Memory: Not enough space to allocate 150994944 B DRAM "
+             "buffer across 12 banks ... (allocated: 1056285728 B, free: "
+             "15536064 B) — 20B QwenImageTransformer2DModel does not fit a "
+             "single device; needs multi-chip tensor-parallel — "
+             "https://github.com/tenstorrent/tt-xla/issues/NNNN")
+  ```
+  Draft the issue body (component, class, params, full error, repro, the
+  tensor-parallel resolution) into
+  `.claude/bringup/<safe_key>/issue_<component>_oom.md`. Filing the issue and
+  replacing `NNNN` is an outward-facing action — leave it to the operator
+  unless told otherwise; until then a clearly-marked `issues/TBD-<COMPONENT>`
+  placeholder is acceptable in the committed reason.
+- **Other failures** (PCC drop, compile error) → route through
+  `model-bringup-diagnose` / `runtime-failure-debugger`, not a blanket xfail.
+
+The **tensor-parallel YAML entries** (Step 7 shard specs registered in
+`test_config_inference_tensor_parallel.yaml` as `NOT_SUPPORTED_SKIP`) remain
+the record for the multi-chip follow-up. They coexist with these single-device
+test files; do not delete them.
+
+Run `pre-commit` on the new test files (black collapses imports, isort orders
+them, copyright header is required) before handing off.
 
 This skill does *not* execute tests — `model-bringup-run` runs `test_path` with
 PCC enforced by the test's `ComparisonConfig`.
 
 ---
 
-## Step 9 — State, log, and output
+## Step 10 — State, log, and output
 
-`state.json` gets a `details.scaffold_variant: "pipeline"` marker, plus:
+`state.json` gets `details.scaffold_variant: "pipeline"`, plus
+`components_scaffolded`, `denoise_steps_observed`, `device`, `chip_count`,
+`weight_fit_path`, and `io_spec_path`. The `stage` advances to
+`SCAFFOLD_DONE` and the per-component single-device results
+(`passed` / `xfail_oom`) are recorded in `history`.
 
-```json
-{
-  "components_scaffolded": ["unet", "vae", "text_encoder", ...],
-  "denoise_steps_observed": 2,
-  "device": "n150",
-  "chip_count": 2,
-  "tt_visible_devices": "0,1",
-  "io_spec_path": ".claude/bringup/<safe_key>/scaffold_pipeline.json"
-}
-```
+Append a `STEP 1P — Pipeline Scaffold` block to `bringup_steps.txt` capturing:
+HF repo, family, pipeline class, total params, per-component table (class /
+params / source), capture pass + which components were live vs derived, device
++ chip-count + shard specs, loader path, variants written, **test files
+written**, and the per-component single-device result (PASSED / xfail-OOM).
 
-Append to `bringup_steps.txt`:
-
-```
---------------------------------------------------------------------------------
-STEP 1P — Pipeline Scaffold (model-bringup-scaffold-pipeline)
---------------------------------------------------------------------------------
-HF repo            : <repo>
-Family             : <family>
-Pipeline class     : <e.g. StableDiffusionXLPipeline>
-Total params       : ~<X.Y B>
-Components         : <n>
-  - <name>  class=<...>  params=~<...>  source=<...>
-  - ...
-Capture pass       : <PASS|FAIL>  steps=<N>  log=.claude/bringup/<safe_key>/capture.log
-Device target      : <n150|p150|auto-resolved-to-...>
-Chip count         : <k>
-TT_VISIBLE_DEVICES : <value>
-Shard specs        :
-  - <component> : <data_parallel|tensor_parallel mesh=...>
-  - ...
-
-Loader path        : third_party/tt_forge_models/<family>/pytorch/loader.py
-Variants written   :
-  - <FAMILY>_<COMPONENT>
-  - ...
-
-YAML entries added :
-  - <model_key 1>
-  - ...
-
-SCAFFOLD RESULT    : PASSED
-```
-
-Terminal output (one screen):
-
-```
-[scaffold-pipeline] PASSED
-  hf repo         : <repo>
-  components      : <n>  (unet, vae, text_encoder, ...)
-  total params    : ~<X.Y B>
-  device          : <n150|p150>
-  chip_count      : <k>     (uniform across components)
-  TT_VISIBLE_DEVICES=<value>
-  loader          : third_party/tt_forge_models/<family>/pytorch/loader.py
-  component tests : tests/torch/models/<family>/ (n files / nodes)
-  next stage      : model-bringup-run (per component test_path)
-```
+Terminal output (one screen) should list: hf repo, components, total params,
+device, chip_count, loader path, test files, and per-component single-device
+result, then `next stage: file OOM issues + open PR` (or `model-bringup-run`
+if any component is still pending a HW run).
 
 ---
 
 ## Hard rules
 
-- **No source-package mutation.** Instrumentation in step 4 must be in a
-  temp overlay or runtime monkey-patch. Never write into the installed
-  `diffusers` / `transformers` tree — the next test on this machine
-  inherits the contamination.
-- **One forward capture pass.** Step 5 runs the real pipeline exactly
-  once, on CPU, with minimal resolution and 2 denoise steps. We need
-  shapes, not images.
-- **All model code stays in tt-forge-models.** The test runner must not
-  reach into `pipe.unet` itself; the loader returns the component. If you
-  catch yourself writing `pipeline.<component>` in a test file, the
-  loader is wrong.
-- **Synthetic inputs only.** `load_inputs()` builds tensors with the
-  captured shape/dtype using `torch.randn`/`torch.randint`. It does
-  **not** re-run the pipeline to derive inputs — that breaks the
-  component-isolation contract.
-- **Uniform chip count only on multichip promotion.** Single-chip bringup
-  uses `chip_count = 1` per component that is `single_device_only`. When
-  `/model-bringup-multichip` promotes a **weight-bound** component, sibling
-  components on the same pipeline demo may **replicate** on that mesh
-  (`load_shard_spec` → `None`) but keep **single_device** runner keys.
-- **Bail early on wrong target.** If `model_index.json` does not declare
-  a `Pipeline`, return `result=wrong_skill` and let
-  `model-bringup-scaffold` handle the single-component case.
-- **Size gate still applies, but per-component.** If the largest
-  component cannot fit on the chosen device at `chip_count = 8`, block
-  the pipeline — do not silently downgrade to a smaller variant.
+- **Single-device first.** Bring each component up on one device before any
+  multi-chip work. A PR with one passing component + OOM-xfailed big components
+  is complete and landable.
+- **OOM is a capacity fact, not a bug.** Component-too-big-for-device OOMs
+  deterministically — xfail it with the exact message + issue; do not re-run to
+  "confirm" and do not send it to the runtime debugger.
+- **Never load the whole pipeline for a large model.** Fetch each component
+  directly via `Class.from_pretrained(repo, subfolder=...)`. Pulling a 20–30 B
+  `DiffusionPipeline` into host RAM to grab one component will OOM the host.
+- **Wrap every component to a tensors-only `forward`.** Pin the captured
+  non-tensor structural args inside the wrapper, select the right callable
+  (`decode` vs `forward`), and unwrap output objects to a bare tensor. If a
+  test file has to pass non-tensor args or unpack the output, the wrapper is
+  wrong.
+- **Tests are standalone files, not YAML-runner entries.** Pipeline component
+  bringups live in `tests/torch/models/<family>/test_<component>.py` and call
+  `run_graph_test`. Tests run fp32. The tensor-parallel YAML entries are a
+  separate, coexisting record for the multi-chip follow-up.
+- **No source-package mutation.** Step 4 instrumentation is a monkey-patch or
+  a deletable overlay — never edit the installed `diffusers`/`transformers`.
+- **Capture once, on CPU, and bail past the slow VAE decode.** Derive the VAE
+  latent shape analytically rather than waiting minutes for a CPU decode.
+- **Synthetic inputs only.** `load_inputs()` builds tensors at captured
+  shape/dtype; it never re-runs the pipeline.
+- **Bail early on wrong target.** If `model_index.json` does not declare a
+  `Pipeline`, return `result=wrong_skill` for `model-bringup-scaffold`.
+- **Boards vs chips for `TT_VISIBLE_DEVICES`.** Never set `TT_VISIBLE_DEVICES`
+  from `runtime_chip_count` / mesh size. Use **`tt-smi -ls`** via
+  `probe_host.py` (`visible_board_count`). Mesh uses runtime chips; VIS uses
+  board IDs only.
+- **Uniform chip count on multichip promotion only.** Single-chip bringup uses
+  one device per `single_device` component. When `/model-bringup-multichip`
+  promotes a weight-bound component, siblings may **replicate** on that mesh
+  (`load_shard_spec` → `None`) but keep `single_device` tests.
 
 ---
 
@@ -530,7 +593,10 @@ Terminal output (one screen):
 
 - `model-bringup-scaffold` — sibling skill for single-component models;
   this skill replaces it for pipelines.
-- `model-bringup-run` — executes per-component variants after this
-  skill registers them.
-- `failure_summary` — name-based param heuristic table (also used here as
-  the step-2 fallback).
+- `model-bringup-overview` — golden capture / CPU sanity for each component.
+- `model-bringup-run` / `model-bringup-run-torch-tp` — execute component tests.
+- `model-bringup-multichip` — promotion-only TP follow-up.
+- `model-bringup-multichip/references/host_device_probe.md` — tt-smi routing.
+- `model-bringup-diagnose` / `runtime-failure-debugger` — for non-OOM
+  failures (PCC, compile).
+- `failure_summary` — name-based param heuristic table (step-2 fallback).
