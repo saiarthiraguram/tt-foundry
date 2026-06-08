@@ -42,9 +42,38 @@ probe degrees with `{d | num_heads % d == 0}`. Document the chosen degree in
 `scaffold_multichip.json` (`head_constraint` field). Do not pick 8-way TP when
 heads=28 (HunyuanImage) — use 4 or 2.
 
-**Large LM text encoders on multichip:** if the test OOMs on replicated logits,
-set `logits_to_keep=1` in loader inputs so lm_head runs on the last token only
-(FLUX.2 Mistral3 TE pattern); hidden states for the pipeline remain full-seq.
+**Large LM text encoders on multichip (`logits_to_keep`):** optional memory fix when
+OOM is from **replicated full-sequence logits** (`lm_head` output), not from backbone
+activations. `logits_to_keep=1` skips vocab projection on all but the last token;
+the transformer stack still runs on the **full prompt length**.
+
+**Apply only when ALL of:**
+
+1. Component is a **causal LM** (`*ForCausalLM` or equivalent) that accepts
+   `logits_to_keep` in `forward`.
+2. Log / classify-oom evidence points to **logits / lm_head** buffer
+   (`[batch, seq, vocab]` replicated on multichip) — not attn/MLP activations.
+3. Loader wrapper / test **`run_graph_test` compares hidden states** (or another
+   non-logits tensor the pipeline consumes). Confirm from loader + capture spec:
+   output is e.g. `hidden_states[-1]` with shape `(batch, seq, hidden)` — **not**
+   logits and **not** a last-token-only hidden slice unless the pipeline truly
+   uses one position.
+4. **CPU golden uses the same** `logits_to_keep` (and same wrapper output) so PCC
+   stays apples-to-apples.
+
+**Do not apply when:**
+
+- Encoder is **encoder-only** (T5, CLIP, UMT5, ByT5, …) — no `logits_to_keep`.
+- Test or pipeline consumes **full-sequence logits** or **per-token logits**.
+- Wrapper returns **last-token hidden states only** but downstream needs **every
+  token** — fix the wrapper/output contract first; do not use `logits_to_keep` as
+  a substitute for full-seq conditioning.
+- OOM is **weight-bound** or **backbone activation** bound — `logits_to_keep`
+  will not help; use shard repair / resolution / promotion instead.
+
+**Does not change weights or pipeline semantics** when guards pass: full-seq hidden
+states for cross-attention remain; only unused `lm_head` work is dropped
+(FLUX.2 Mistral3 TE pattern).
 
 ## Test discovery
 

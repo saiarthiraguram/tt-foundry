@@ -10,9 +10,12 @@ full pipeline `generate()`.
 | **Monolithic** (`test_models.py`) | `tests/runner/test_config/...yaml` | Runner collect + YAML `required_pcc` | YAML + test |
 | **Pipeline component** | `tests/torch/models/<family>/` | **`@pytest.mark.nightly`** + `model_test` + `single_device` or `tensor_parallel` | **`ComparisonConfig(required_pcc=0.99)` in the test** — not runner YAML |
 
-Do **not** add Hunyuan/Krea/Mochi-style component tests to
-`test_config_inference_single_device.yaml`. Nightly jobs filter on markers
-(see `pytest.ini`: `nightly`, `model_test`, `single_device`, `tensor_parallel`).
+Do **not** register **pipeline component** tests — any pytest node under
+`tests/torch/models/<family>/` — in `test_config_inference_single_device.yaml`
+or `test_config_inference_tensor_parallel.yaml`. That runner path is for
+**monolithic** `test_all_models_torch[...]` keys only. Component bringups use
+standalone test files and nightly CI filters on markers (see `pytest.ini`:
+`nightly`, `model_test`, `single_device`, `tensor_parallel`).
 
 ## Per-component single vs multichip (pipeline)
 

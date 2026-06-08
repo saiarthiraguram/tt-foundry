@@ -24,6 +24,12 @@ Set `promote_multichip: true` only when `class` is `weight_runtime` or `weight_p
   shard repair (FLUX.2 transformer on 8-chip llmbox). **Action:** shard the wide
   intermediate, or `reduce_activation_footprint` (lower seq_len / frames) — not more
   weight-only row-parallel layers.
+- **Replicated logits peak (causal LM text encoder, multichip):** OOM on
+  `[batch, seq, vocab]` from `lm_head` while weights fit. **Action:** only if
+  loader/test compares **hidden states** (full-seq) and model supports it, set
+  `logits_to_keep=1` on **both** CPU and TT — see guards in
+  `model-bringup-run-torch-tp/SKILL.md`. Do **not** use if test compares logits
+  or encoder is T5/CLIP-style.
 - **Action:** REPAIR on same arch (reduce_resolution, enable_vae_tiling, enable_compile_flags), then dtype_bf16_activations.
 
 ## weight_runtime
