@@ -19,6 +19,7 @@ skills/
 ├── model-bringup-finalize/           # FINALIZE stage — multi-arch reverify, pre-commit, PR draft
 ├── runtime-failure-debugger/         # Op-level bisect invoked by runtime_debug repair strategy
 ├── graph-break-analysis/             # Auxiliary: torch.compile graph-break investigation
+├── issue-create/                     # Draft GitHub issue packages (.claude/issues/) — never auto-files
 ├── model_issue_pick/                 # XFAIL re-triage (single entry)
 ├── failure_summary/                  # YAML digest of all KNOWN_FAILURE_XFAIL entries
 ├── potential_new_models/             # SOTA bringup-candidate suggester
@@ -48,6 +49,8 @@ scaffold  overview   run    diagnose     repair    verify     config-update   fi
 
 Auxiliary skills hang off the same FSM but enter from different states:
 
+- `issue-create` — draft `title.txt` + `draft.md` + `manifest.json` + `gh-command.sh`
+  under `.claude/issues/` from bringup escalations or pytest logs (developer runs `gh` manually)
 - `model_issue_pick` — re-triage a single existing `KNOWN_FAILURE_XFAIL` entry
 - `failure_summary` — digest the XFAIL list for triage / sharing
 - `potential_new_models` — suggest the next wave of bringup candidates
