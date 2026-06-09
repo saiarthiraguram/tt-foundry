@@ -17,6 +17,11 @@ The `--diagnosis` value is the JSON object output by `model-bringup-diagnose`.
 Apply the repair strategy indicated by the diagnosis. Write any patch to
 `.claude/bringup/<safe_key>/patches/iter_<N>_<strategy>.py` (or `.txt` for config changes).
 
+**Single-chip only:** do **not** implement multichip / TP / `TT_VISIBLE_DEVICES`
+changes here. If `model-bringup-classify-oom` or diagnosis sets
+`promote_multichip`, return without patching and let the orchestrator write
+`promotion.json` for `/model-bringup-multichip`.
+
 ## Strategy Implementations
 
 ### `monkey_patch` (graph break)
@@ -34,6 +39,43 @@ Try strategies in order, stopping when one resolves the OOM:
 2. Reduce `DEFAULT_NUM_FRAMES` to 9 (minimum: 8k+1).
 3. If still OOM after both: add `@pytest.mark.skip(reason=_OOM_SKIP_REASON)` to
    the failing variant and note it for escalation.
+
+### `reduce_resolution` (activation OOM — same arch)
+
+Use when classify-oom / diagnosis class is **`activation`**. Stay on the
+**current** `TT_XLA_ARCH` (n150 or p150); do not add chips. Before VERIFY, re-run
+`probe_host.py` — if `can_run_single_chip_bringup` is false, stop (wrong host; user must
+change machine; do not burn repair iterations on fabric hosts).
+
+1. Switch loader `load_inputs()` to low-res helpers if present (e.g.
+   `load_transformer_inputs` vs `load_transformer_inputs_full_res` in Mochi).
+2. Halve latent H/W or frame count in `src/utils.py` constants.
+3. Record `details.resolution_tier: low` in state history.
+
+### `enable_vae_tiling` (pipeline VAE — same arch)
+
+If component is VAE and loader supports tiled variant (e.g. Mochi `MOCHI_TILED`),
+switch variant or enable tiling in loader config. Same arch only.
+
+### `enable_compile_flags` (same arch)
+
+Set env for the **next** run (document in repair output, not permanent shell):
+- `experimental-enable-dram-space-saving-optimization=true` via
+  `torch_xla.set_custom_compile_options` in test or conftest snippet.
+- `CONVERT_SHLO_TO_SHARDY=1` only when already on multichip path — **not** for
+  single-chip activation repair unless explicitly debugging Shardy on one chip.
+
+### `dtype_bf16_activations` (same arch)
+
+Use after activation repairs failed on **fp32** for this arch.
+
+1. Re-run with `dtype_override=torch.bfloat16` in loader for inputs + model.
+2. Record `details.dtype_ladder[<arch>]: bf16` in state.
+3. If bf16 passes → diagnosis class `dtype_only`; orchestrator CONFIG_UPDATE.
+4. If bf16 still weight-bound → orchestrator may mark arch failed and try next
+   eligible arch or promotion.
+
+**Do not** lower PCC thresholds as a repair strategy.
 
 ### `fix_output_handling`
 1. Inspect the wrapper's `forward()` in `model_utils.py`.

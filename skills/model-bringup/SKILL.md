@@ -28,14 +28,14 @@ Parse `$ARGUMENTS`:
   - `retriage` — the XFAIL re-triage FSM (see **XFAIL Re-triage Mode** below).
     Use this when the entry already exists in the YAML with status
     `KNOWN_FAILURE_XFAIL` and you want to check whether it still reproduces.
-- `--arch` (optional, default `n150`): single target architecture for the
-  FSM loop. Equivalent to `--archs <arch>`.
-- `--archs` (optional): comma-separated list of architectures, e.g.
-  `n150,p150`. The first arch runs through the full FSM
-  (VALIDATE → … → CONFIG_UPDATE). Remaining archs are re-verified by
-  `model-bringup-finalize` after the first arch passes. If both
-  `--arch` and `--archs` are given, `--archs` wins.
+- `--arch` (optional): force a **single** arch for the whole bringup (debug or
+  p150-only components). Equivalent to `--archs <arch>` with one entry.
+- `--archs` (optional): comma-separated single-chip arches, default derived
+  from `weight_fit.json` after VALIDATE — typically `n150,p150` when both
+  eligible. See **Per-arch single-chip loop** below.
 - `--resume` (optional flag): resume from existing state.json instead of starting fresh
+
+If both `--arch` and `--archs` are given, `--archs` wins.
 
 ## No-key behavior
 
@@ -137,8 +137,91 @@ section per fall-through stage if `xfail_changed` routed into DIAGNOSE.
 Every step section follows the standard timing template (`Start:` /
 `End:` / `Elapsed:` at the top of the section).
 
+## Host probe (mandatory after VALIDATE; re-run before FIRST_RUN and VERIFY)
+
+Probe the **current SSH session** with `probe_host.py` — see `host_device_probe.md`.
+
+```bash
+python <skills>/model-bringup-multichip/scripts/probe_host.py \
+  --arch-queue <planned,n150,p150> [--p150-only] \
+  -o .claude/bringup/<safe_key>/host_probe.json
+```
+
+Persist `state.details.host_probe`. Use **`runtime_chip_count`** for mesh; **`visible_board_count`**
+from tt-smi for `TT_VISIBLE_DEVICES` (not ird board count).
+
+**Hard rules:**
+
+| Bringup | Requires | On wrong host |
+|---------|----------|---------------|
+| **`/model-bringup`** (n150/p150) | `can_run_single_chip_bringup` → **`runtime_chip_count == 1`** | **Skip** all HW; no pytest; no `TT_VISIBLE_DEVICES=0` on fabric |
+| **`/model-bringup-multichip`** | `can_run_multichip_bringup` → **`runtime_chip_count >= 2`** + tt-smi boards | **Skip** TP; tell user to change host or fix env |
+
+**Pipeline component gate** (read `weight_fit.json` → active `parallelism_mode`):
+
+```bash
+MODE=$(jq -r '.components[] | select(.name=="<component>") | .parallelism_mode' weight_fit.json)
+MESH=$(jq -r '.chip_count // 0' scaffold_multichip.json 2>/dev/null || echo 0)
+python .../probe_host.py --parallelism-mode "$MODE" --expected-mesh-chips "$MESH" -o host_probe.json
+CAN=$(jq -r '.can_run_component // empty' host_probe.json)
+if [ "$CAN" = "false" ]; then
+  # Print component_skip_reason; stage=host_skip; STOP — user changes machine
+fi
+```
+
+| `parallelism_mode` | Example on n300 llmbox (8 chips, 4 boards) |
+|--------------------|---------------------------------------------|
+| `single_device` | **SKIP** — no n150; user moves to 1-chip host |
+| `tensor_parallel` | Run if mesh ∈ `valid_tp_degrees` (2/4/8); `TT_VISIBLE_DEVICES=0,1,2,3` |
+
+Re-probe before **VERIFY** after repair. If skip → `stage: host_skip`, print
+`component_skip_reason`, `single_chip_skip_reason`, or `multichip_skip_reason`.
+
+## Per-arch single-chip loop (bringup mode)
+
+After VALIDATE **and host probe**, read `.claude/bringup/<safe_key>/weight_fit.json`:
+
+1. `arch_queue` = `$ARCHS` from CLI if set, else `eligible_archs` from weight_fit
+   (order: **`n150` then `p150`** when both present).
+2. If `p150_only` on active component, `arch_queue = [p150]`.
+3. **Filter** with `probe_host.py` → use `runnable_arch_queue`; record `skipped_archs`.
+   If `runnable_arch_queue` is empty → `host_skip` (no pytest on this machine).
+4. Persist `state.arch_queue`, `state.arch_results = {}`.
+
+For each `current_arch` in `arch_queue`:
+
+- Set `state.current_arch = current_arch`, `TT_XLA_ARCH=current_arch` for runs.
+- Run **OVERVIEW** once globally (first arch only); then per-arch **FIRST_RUN fp32**.
+- On fail → invoke **`model-bringup-classify-oom`** with `--arch current_arch`.
+- Map class → repair: `activation` → `reduce_resolution` / `enable_vae_tiling` /
+  `enable_compile_flags`; then `dtype_bf16_activations` on **same arch**.
+- `arch_insufficient` on n150 → record in `arch_results.n150`, **continue** to p150
+  (not promotion).
+- On **PASSED** for this arch → `arch_results[current_arch] = passed`; continue to
+  **next** arch in queue (verify **both** when both eligible).
+- On **weight_bound** for this arch (after bf16 ladder) →
+  `arch_results[current_arch] = weight_bound`.
+
+After the arch queue:
+
+- If **any** arch `passed` → CONFIG_UPDATE with `supported_archs` = passing arches
+  → FINALIZE → **done** (no multichip).
+- If **all** arches `weight_bound` (none passed) → invoke
+  **`model-bringup-write-promotion`** (writes `promotion.json` via
+  `model-bringup-multichip/scripts/write_promotion.py`), set
+  `state.stage = promotion_pending`, print:
+  ```
+  Single-chip exhausted (weight-bound on: <list>). Next:
+  /model-bringup-multichip <model_key> --from-promotion
+  ```
+  Do **not** auto-invoke multichip in the same turn.
+
+Dtype policy: see `model-bringup-multichip/references/dtype_ladder.md` — match
+source dtype (bf16 when HF/loader/script uses bf16); fp32-first only when justified.
+
 ## FSM Loop
-Run the following loop (max 5 iterations total across repair cycles).
+Run the following loop (max 5 iterations total across repair cycles) **within each
+arch** in `arch_queue`.
 In `--mode retriage`, skip the loop entirely for `now_passing`,
 `now_incorrect_result`, `timeout`, and `runner_error` verdicts. For both
 `xfail_same` and `xfail_changed` verdicts, enter the loop at **DIAGNOSE**
@@ -195,6 +278,14 @@ Routing precedence: if the user explicitly passed a variant flag (e.g.
 hypothetical future `--scaffold github`), respect it; otherwise pick by
 the table above.
 
+**Pipeline families (`model-bringup-scaffold-pipeline`):** bring up **each
+component separately** using `weight_fit.json` → `components[].test_path`
+(under `tests/torch/models/<family>/`). Each component has its own
+`parallelism_mode` (`single_device` vs `tensor_parallel`). Do **not** use
+runner YAML or `test_all_models_torch[...]` for component PCC — tests must
+use `ComparisonConfig(required_pcc=0.99)` and `model-bringup-run` must
+execute that node. See `component_test_patterns.md`.
+
 **OVERVIEW**: Invoke `model-bringup-overview` skill with the model_key.
 This runs the loader on CPU with random inputs and writes:
 - `model_overview.md` — the model card (family, params, modality, signature)
@@ -208,12 +299,11 @@ would have produced the same failure at higher cost, and the diagnosis
 would be misleading because it would point at TT runtime instead of the
 real (loader) cause.
 
-If the size gate (in scaffold) recorded a `shard_plan` and the user did
-not pass `--archs` indicating a multi-chip target, surface the plan once
-here as a warning: "Warn-band model — see state.details.shard_plan in
-state.json". Do not block on it; the user already confirmed in scaffold.
+If `weight_fit.json` shows `weight_predicted` on any arch, print a one-line
+hint (non-blocking): see `eligible_archs` and `model-bringup-multichip/references/dram_budget_torch_tp.md`.
 
-**FIRST_RUN / VERIFY**: Invoke `model-bringup-run` skill with model_key and arch.
+**FIRST_RUN / VERIFY**: Invoke `model-bringup-run` with model_key and
+`state.current_arch` (from per-arch loop).
 
 For **VERIFY** specifically: if the previous repair stage was `runtime_debug`
 and recorded a `sanity_test_path` in state, **gate the full-model run on the
@@ -248,7 +338,9 @@ Then, regardless of how VERIFY arrives at the full-model invocation:
       CONFIG_UPDATE with result=TIMEOUT, then STOP.
 - On fail → save log path to state, transition to DIAGNOSE.
 
-**DIAGNOSE**: Invoke `model-bringup-diagnose` skill with the log from the last run.
+**DIAGNOSE**: For DRAM/OOM failures, invoke **`model-bringup-classify-oom`** first,
+then `model-bringup-diagnose` with the log (pass classification JSON into diagnosis
+context). Route repair per classification — not multichip from REPAIR.
 - If confidence is `low` and iteration >= 2 → ESCALATED.
 - If diagnose sets `escalation_skill: "runtime-failure-debugger"` (i.e.
   `suggested_repair_strategy: "runtime_debug"`) → REPAIR with that strategy.

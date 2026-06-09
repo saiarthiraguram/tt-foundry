@@ -53,8 +53,8 @@ the convention proven by the Playground v2.5 and Qwen-Image component-test PRs:
 
 A single-device component-test PR with one pass + a couple of OOM xfails is a
 complete, landable bringup. Tensor-parallel multi-chip is a **follow-up**, not
-a prerequisite — but you still emit the shard specs now (Step 6) so that
-follow-up has everything it needs.
+a prerequisite — but you still emit `weight_fit.json` and shard specs now
+(Steps 6–7) so the follow-up has everything it needs.
 
 OOM here is a **capacity fact, not a bug**: if a component's weights exceed the
 device's DRAM bank capacity, it OOMs every time. Do not re-run to "confirm" the
@@ -190,7 +190,7 @@ def _probe(orig, tag):
 
 **Capture the non-tensor structural args too** (`img_shapes`, `txt_seq_lens`,
 `guidance`, `added_cond_kwargs` dict fields, `return_dict`). These are the args
-the wrapper in Step 7 must *pin* — if you only log tensor shapes you will not
+the wrapper in Step 8 must *pin* — if you only log tensor shapes you will not
 know what to hardcode and the wrapper's `forward` will be wrong.
 
 **Critical:** never mutate the installed `diffusers` / `transformers` source
@@ -241,9 +241,56 @@ parsed values to `io_spec_raw.json` for auditability.
 
 ---
 
-## Step 6 — Device target & shard-spec planning (for the multi-chip follow-up)
+## Step 6 — Per-component weight_fit (n150 + p150 single-chip)
 
-Even though Step 8 tests on a single device first, compute and record the
+For **each** component in the Step 2 table, compute `weight_fit` using the
+same rules as `model-bringup-scaffold` Step 4b and
+`model-bringup-multichip/references/dram_budget_torch_tp.md`:
+
+- **n150** = 12 GiB, **p150** = 32 GiB per device, **85%** weight budget.
+- `activation_class`: `video` if pipeline class matches
+  `Video|I2V|T2V|HunyuanVideo|LTX|Wan|CogVideo|Mochi`; else `image` for
+  diffusion pipelines; `text_encoder` for TE subfolders; `vae` for vae.
+
+Write **one** merged file:
+`.claude/bringup/<safe_key>/weight_fit.json` with `components[]` (see
+`model-bringup-multichip/references/weight_fit_schema.md`).
+
+Per component record:
+- `eligible_archs` — arches where `fits_fp32` or `fits_bf16`
+- `p150_only` — true when only p150 is eligible (Janus Pro-7B pattern)
+- `weight_predicted` per arch — hint for orchestrator, **not** a skip of single-chip
+- **`parallelism_mode`** — **`single_device`** or **`tensor_parallel`** (per
+  component, not one choice for the whole pipeline). Decide from weight_fit:
+  - **`single_device`**: bf16 weights fit on one chip on at least one eligible
+    arch → `@pytest.mark.single_device`; bringup runs
+    `tests/torch/models/<family>/test_<role>.py` (unsharded path).
+  - **`tensor_parallel`**: weight-bound on every eligible single-chip arch →
+    scaffold a sharded test (e.g. `test_transformer_sharded`) and/or promote
+    later via `/model-bringup-multichip`; `@pytest.mark.tensor_parallel` on the
+    sharded node (Krea/Mochi/Wan pattern).
+- **`single_device_only`**: true when `parallelism_mode == single_device` and
+  the component must **never** be the primary TP promotion target (encoders, VAE).
+  On a multichip mesh for a sibling DiT, replicate only (`load_shard_spec` → `None`).
+- **`test_path`** — exact pytest node for `model-bringup-run` (mandatory).
+
+**Do not** pick one parallelism mode for the entire pipeline — text_encoder may
+be `single_device` while transformer is `tensor_parallel` on the same family.
+
+Multichip TP is **promotion-only** for components with
+`parallelism_mode: tensor_parallel` (or after single-chip exhaust + `promotion.json`).
+
+Optional `promotion_hint` per component in `scaffold_pipeline.json` (mesh
+chip count **estimate only** for humans) — must not auto-run multichip.
+
+Copy `eligible_archs` summary into `scaffold_pipeline.json` under
+`components[].weight_fit`.
+
+---
+
+## Step 7 — Device target & shard-spec planning (for the multi-chip follow-up)
+
+Even though Step 9 tests on a single device first, compute and record the
 multi-chip plan now so the follow-up bringup is ready.
 
 Ask the user (via `AskUserQuestion`) which target device (n150 ~7 B/chip,
@@ -259,14 +306,22 @@ def needed_chips(params, device, is_video_gen):
 ```
 
 `is_video_gen` is True if the pipeline class name contains
-`Video|I2V|T2V|HunyuanVideo|LTX|Wan|CogVideo`.
+`Video|I2V|T2V|HunyuanVideo|LTX|Wan|CogVideo|Mochi`.
 
 Apply the **uniform-chip-count rule** for the *fabric demo*: if any component
-needs N chips, the pipeline-wide `chip_count` is that max, and you emit shard
-specs for every component. Record `device`, `chip_count`, `tt_visible_devices`,
-and `shard_specs` in `scaffold_pipeline.json`. Shard-spec rules:
+needs N chips, the pipeline-wide `chip_count` is that max (this is the **mesh /
+runtime chip count** for SPMD), and you emit shard specs for every component.
+Record `device`, `chip_count`, and `shard_specs` in `scaffold_pipeline.json`.
+Shard-spec rules:
 - `params < per_device_cap` → `data_parallel`.
 - `params ≥ per_device_cap` → `tensor_parallel`, mesh `[1, chip_count]`.
+
+**`TT_VISIBLE_DEVICES` is NOT `chip_count`.** Do not set `0..N-1` from
+`chip_count` alone. At run time, **`probe_host.py`** reads **tt-smi -ls**
+resettable **board** count (`visible_board_count`) — e.g. n300 llmbox with
+8 runtime chips → `0,1,2,3` (4 boards), not `0..7`. See `host_device_probe.md`.
+Record only a placeholder note in scaffold JSON if needed; the orchestrator
+and `model-bringup-run-torch-tp` always export from `host_probe.json`.
 
 If the largest component does not fit at `chip_count = 8`, note
 `block_reason="exceeds host fabric capacity"` for the multi-chip path — but
@@ -274,7 +329,7 @@ still scaffold the single-device tests (the OOM xfail is itself the record).
 
 ---
 
-## Step 7 — Write the per-component loader (direct load + wrapper)
+## Step 8 — Write the per-component loader (direct load + wrapper)
 
 Directory layout (one variant *per component*):
 
@@ -290,8 +345,9 @@ third_party/tt_forge_models/<family>/
 
 1. **Embed the captured I/O spec** as a Python literal near the top
    (`_COMPONENT_IO_SPEC = {...}`) plus the shape constants, so the loader is
-   self-contained and reproducible without re-running capture. Embed the
-   `SHARD_SPECS` / `TT_VISIBLE_DEVICES` from Step 6 too.
+   self-contained and reproducible without re-running capture. Embed
+   `SHARD_SPECS` from Step 7. Do **not** hardcode `TT_VISIBLE_DEVICES` in the
+   loader — resolve at run time from `probe_host.py` / tt-smi (see Step 7).
 
 2. **Never load the whole pipeline.** Fetch each component *directly* via its
    own class + `subfolder=` — loading a 28 B `DiffusionPipeline` just to pull
@@ -342,8 +398,9 @@ third_party/tt_forge_models/<family>/
 4. **`ModelVariant(StrEnum)`** with one entry per component
    (`<Prefix>_TextEncoder`, `<Prefix>_Transformer`, `<Prefix>_Vae`). Keep them
    stable — the test files import them by name. `_VARIANTS` maps each to a
-   `ModelConfig(pretrained_model_name=<repo>)`. `DEFAULT_VARIANT` should be the
-   headline component (the transformer/UNet).
+   `ModelConfig(pretrained_model_name=<repo>)` plus `subfolder` (the HF
+   `model_index.json` key). `DEFAULT_VARIANT` should be the headline component
+   (the transformer/UNet).
 
 5. **`load_model(dtype_override=...)`** branches on `self._variant`, does the
    direct `from_pretrained(..., subfolder=...)`, calls `.eval()`, and returns
@@ -360,22 +417,22 @@ variant, and confirm `load_inputs()` shapes match `_COMPONENT_IO_SPEC`.
 
 ---
 
-## Step 8 — Write standalone single-device component tests
+## Step 9 — Write standalone single-device component tests
 
-This is the current convention (Playground v2.5, SDXL-Lightning, Qwen-Image):
-one pytest **file per component** under `tests/torch/models/<family>/`, each
-driving `run_graph_test`. This is **not** the YAML-runner path — pipeline
-component bringups use test files.
+This is the current convention (Playground v2.5, SDXL-Lightning, Qwen-Image,
+Krea, HunyuanImage): one pytest **file per component** under
+`tests/torch/models/<family>/`, each driving `run_graph_test`. This is **not**
+the YAML-runner path — pipeline component bringups use test files.
 
 ```
 tests/torch/models/<family>/
 ├── __init__.py                 # SPDX header only
 ├── test_text_encoder.py
-├── test_transformer.py   (or test_unet.py)
+├── test_transformer.py   (or test_unet.py; may add test_transformer_sharded)
 └── test_vae_decoder.py
 ```
 
-Each test file follows this exact shape:
+Each test file follows this shape (add markers per `weight_fit.json`):
 
 ```python
 # SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
@@ -389,12 +446,14 @@ import torch
 import torch_xla
 import torch_xla.runtime as xr
 from infra import Framework, run_graph_test
+from infra.evaluators import ComparisonConfig, PccConfig
 
 from third_party.tt_forge_models.<family>.pytorch import ModelLoader, ModelVariant
 
 
 @pytest.mark.nightly
 @pytest.mark.model_test
+@pytest.mark.single_device   # or @pytest.mark.tensor_parallel for sharded node
 def test_<component>():
     xr.set_device_type("TT")
     torch.manual_seed(42)
@@ -403,8 +462,27 @@ def test_<component>():
     model = loader.load_model(dtype_override=torch.float32)
     inputs = loader.load_inputs(dtype_override=torch.float32)
 
-    run_graph_test(model, inputs, framework=Framework.TORCH)
+    run_graph_test(
+        model,
+        inputs,
+        framework=Framework.TORCH,
+        comparison_config=ComparisonConfig(pcc=PccConfig(required_pcc=0.99)),
+    )
 ```
+
+Additional rules:
+1. **Test path** — store the exact node in `weight_fit.json` → `test_path`;
+   `model-bringup-run` executes that node (not runner YAML collect).
+2. **PCC 0.99** — enforce in the test via `ComparisonConfig`, not runner YAML.
+3. **Arch guards** — runtime skip from `weight_fit` (`p150_only`); see
+   `arch_eligibility.md`. Do **not** use `@pytest.mark.n150` / `@pytest.mark.p150`.
+4. **Do not add** `test_config_inference_single_device.yaml` entries for pipeline
+   component tests unless the family also has a monolithic `test_models.py` key.
+5. **Host routing** — before HW, `probe_host.py` with `--parallelism-mode` from
+   `weight_fit.json`. **`TT_VISIBLE_DEVICES`** from tt-smi boards
+   (`visible_board_count`); mesh from **`runtime_chip_count`**. On n300 llmbox:
+   `0,1,2,3` for 8 chips — never derive VIS from chip count. See
+   `host_device_probe.md`. Install tt-smi if missing; `tt-smi -r` resets boards.
 
 Notes:
 - Tests run **fp32** (`dtype_override=torch.float32`) even though the loader
@@ -438,7 +516,7 @@ models. Per outcome:
 - **Other failures** (PCC drop, compile error) → route through
   `model-bringup-diagnose` / `runtime-failure-debugger`, not a blanket xfail.
 
-The **tensor-parallel YAML entries** (Step 6 shard specs registered in
+The **tensor-parallel YAML entries** (Step 7 shard specs registered in
 `test_config_inference_tensor_parallel.yaml` as `NOT_SUPPORTED_SKIP`) remain
 the record for the multi-chip follow-up. They coexist with these single-device
 test files; do not delete them.
@@ -446,13 +524,16 @@ test files; do not delete them.
 Run `pre-commit` on the new test files (black collapses imports, isort orders
 them, copyright header is required) before handing off.
 
+This skill does *not* execute tests — `model-bringup-run` runs `test_path` with
+PCC enforced by the test's `ComparisonConfig`.
+
 ---
 
-## Step 9 — State, log, and output
+## Step 10 — State, log, and output
 
 `state.json` gets `details.scaffold_variant: "pipeline"`, plus
 `components_scaffolded`, `denoise_steps_observed`, `device`, `chip_count`,
-`tt_visible_devices`, and `io_spec_path`. The `stage` advances to
+`weight_fit_path`, and `io_spec_path`. The `stage` advances to
 `SCAFFOLD_DONE` and the per-component single-device results
 (`passed` / `xfail_oom`) are recorded in `history`.
 
@@ -497,6 +578,14 @@ if any component is still pending a HW run).
   shape/dtype; it never re-runs the pipeline.
 - **Bail early on wrong target.** If `model_index.json` does not declare a
   `Pipeline`, return `result=wrong_skill` for `model-bringup-scaffold`.
+- **Boards vs chips for `TT_VISIBLE_DEVICES`.** Never set `TT_VISIBLE_DEVICES`
+  from `runtime_chip_count` / mesh size. Use **`tt-smi -ls`** via
+  `probe_host.py` (`visible_board_count`). Mesh uses runtime chips; VIS uses
+  board IDs only.
+- **Uniform chip count on multichip promotion only.** Single-chip bringup uses
+  one device per `single_device` component. When `/model-bringup-multichip`
+  promotes a weight-bound component, siblings may **replicate** on that mesh
+  (`load_shard_spec` → `None`) but keep `single_device` tests.
 
 ---
 
@@ -505,7 +594,9 @@ if any component is still pending a HW run).
 - `model-bringup-scaffold` — sibling skill for single-component models;
   this skill replaces it for pipelines.
 - `model-bringup-overview` — golden capture / CPU sanity for each component.
-- `model-bringup-run` — executes the per-component single-device tests.
+- `model-bringup-run` / `model-bringup-run-torch-tp` — execute component tests.
+- `model-bringup-multichip` — promotion-only TP follow-up.
+- `model-bringup-multichip/references/host_device_probe.md` — tt-smi routing.
 - `model-bringup-diagnose` / `runtime-failure-debugger` — for non-OOM
   failures (PCC, compile).
 - `failure_summary` — name-based param heuristic table (step-2 fallback).

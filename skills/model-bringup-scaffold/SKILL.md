@@ -147,72 +147,81 @@ If no lines appear, the loader failed to import during collection — check the 
 
 ---
 
-## Step 4b — Pre-flight size gate
+## Step 4b — Pre-flight weight_fit (per-arch DRAM gate)
 
-Before any pytest run, estimate the model's parameter count and reject
-anything that obviously cannot fit on a single device. This prevents the
-pipeline from burning an hour on a 70B model that will OOM during compile.
+Before any pytest run, estimate parameter count and write
+`.claude/bringup/<safe_key>/weight_fit.json`. Full schema:
+`model-bringup-multichip/references/weight_fit_schema.md`. DRAM table:
+`model-bringup-multichip/references/dram_budget_torch_tp.md`.
 
-Order of preference:
+**Helper script** (preferred when param count is known):
+```bash
+python model-bringup-multichip/scripts/compute_weight_fit.py \
+  --model-key "<model_key>" \
+  --num-params <N> \
+  --hf-repo "<org/repo>" \
+  --param-source loader \
+  --output .claude/bringup/<safe_key>/weight_fit.json
+```
+For pipeline models, add `--component <name>` and `--test-path <pytest node>`.
 
-1. **Live count from the loader** (most accurate):
-   ```python
-   from third_party.tt_forge_models.<family>.pytorch import ModelLoader
-   m = ModelLoader().load_model()
-   n = sum(p.numel() for p in m.parameters())
-   ```
-   Skip if the loader requires HF download and offline-mode is set, or if
-   `load_model()` would itself cost minutes (large checkpoints).
+**Do not hard-reject** large models or route to multichip here — single-device
+bringup always proceeds on eligible arch(es); multichip is promotion-only
+after HW proves weight-bound on every eligible arch.
 
-2. **Config-only count** (fast, weights not loaded):
-   ```python
-   from transformers import AutoConfig
-   c = AutoConfig.from_pretrained("<hf_id>")
-   # most HF configs expose num_parameters or hidden_size+num_layers+vocab_size
-   ```
+### Parameter estimate (order of preference)
 
-3. **Name-based heuristic** (always available — same regex table as
-   `failure_summary`):
-   - Explicit `\d+(?:\.\d+)?B` tokens → that many billion params
-   - `\d+M` tokens → that many million
-   - Fallback: 100M
+1. **Live count** from loader (`sum(p.numel())`) when cheap.
+2. **Config-only** (`AutoConfig.from_pretrained`).
+3. **Name heuristic** (same regex table as `failure_summary`).
 
-**Gate logic** (single-device-inference target on n150):
+### Per-arch DRAM (single chip)
 
-| Params estimate | Action |
-|---|---|
-| < 14 B  | proceed |
-| 14–30 B | warn — likely OOM, **emit shard plan** (see below), then ask the user to confirm before continuing |
-| > 30 B  | **reject** with `result=blocked`, `block_reason="exceeds single-device capacity; route to multi_chip pipeline"` (still emit shard plan so escalation has something to act on) |
-
-Record the estimate (and its source: `loader | config | name_heuristic`) in
-state.json under `details.param_estimate` so escalation reports can show
-the gate decision.
-
-### Shard plan (warn-band or reject)
-
-When the estimate is ≥ 14 B, compute and persist a shard plan into
-`state.json` under `details.shard_plan`:
-
-```json
-{
-  "params_billions": <X>,
-  "fits_single_device_n150": false,
-  "suggested_mesh": "1x2" | "1x4" | "1x8" | "2x4",
-  "tt_visible_devices": "0,1" | "0,1,2,3" | ...,
-  "rationale": "<one line: 'fp16 param bytes / device L1 budget' or 'matches mesh used by <peer model>'>"
-}
+```python
+DRAM_BYTES = {"n150": 12 * 2**30, "p150": 32 * 2**30}  # Wormhole / Blackhole
+BUDGET_FRAC = 0.85
+weight_bytes_fp32 = num_params * 4
+weight_bytes_bf16 = num_params * 2
 ```
 
-Mesh selection (rules of thumb — pick the smallest mesh that fits):
-- ~14–20 B fp16 → `1x2` (`TT_VISIBLE_DEVICES=0,1`)
-- ~20–30 B fp16 → `1x4` (`TT_VISIBLE_DEVICES=0,1,2,3`)
-- > 30 B fp16   → `1x8` or `2x4` (still reject for single-device pipeline
-  but record the plan so the user can re-invoke against the multi-chip
-  pipeline with the right environment).
+For each arch in `n150`, `p150`:
 
-Also print the plan to the steps log under
-`STEP 1 — Parse & Scaffold` so the orchestrator surfaces it on warn/reject.
+- `budget_bytes = int(BUDGET_FRAC * DRAM_BYTES[arch])`
+- `fits_fp32 = weight_bytes_fp32 <= budget_bytes`
+- `fits_bf16 = weight_bytes_bf16 <= budget_bytes`
+- `weight_predicted = not fits_fp32`
+- `eligible_single_chip[arch] = fits_fp32 or fits_bf16`
+
+`eligible_archs` = list of arches with `eligible_single_chip` true.
+`p150_only` = eligible is only `["p150"]`.
+
+### Persist
+
+1. Write `weight_fit.json` (monolithic: one object; see schema).
+2. Record **source dtype** from loader `DTYPE`, HF config, or inference script
+   → `details.source_dtype` in `state.json` (see `dtype_ladder.md`).
+3. Mirror summary in `state.json`:
+   - `details.param_estimate`, `details.weight_fit_path`
+   - `details.eligible_archs`, `details.weight_predicted_any`
+
+### Orchestrator hints (print to terminal)
+
+```
+[scaffold] weight_fit: eligible_archs=[n150, p150]  (or [p150] only)
+  n150: fits_fp32=... fits_bf16=... weight_predicted=...
+  p150: fits_fp32=... fits_bf16=... weight_predicted=...
+  Next: /model-bringup <key> --archs n150,p150   # runs BOTH when both eligible
+```
+
+If **no** arch is eligible even at bf16, set `details.all_arches_ineligible=true`
+and warn — orchestrator may still run one probe or suggest early promotion after
+user confirms.
+
+### Optional shard hint (non-blocking)
+
+If `weight_predicted` on any arch, still record a **hint-only**
+`state.details.shard_plan_hint` for escalation (mesh suggestion) — do **not**
+block VALIDATE and do **not** skip single-chip runs.
 
 ---
 
@@ -362,8 +371,8 @@ Loader created  : yes | no
 Import validation  : python -c "from ... import ModelLoader, ModelVariant" → OK | FAILED
 Collect validation : pytest --collect-only tests/runner/test_models.py | grep '<family>/pytorch-' → <N> test(s) found | NONE FOUND
 
-Size gate          : <X> B params (source: loader | config | name_heuristic) → proceed | warn | reject
-Shard plan         : <mesh> / TT_VISIBLE_DEVICES=<list> | n/a (single-device fits)
+Weight fit         : weight_fit.json → eligible_archs=[...] per n150(12GiB)/p150(32GiB)
+Shard plan hint    : <optional mesh hint if weight_predicted> | n/a
 
 Custom test file   : <path or 'none — generic runner suffices'>
 
