@@ -1,17 +1,25 @@
 ---
 name: add-benchmark-model
-description: Add a model to the tt-xla benchmark suite and wire it into the nightly perf pipeline. Picks the right harness (vision / llm / encoder / multimodal), writes a config-driven test_<model> entry that drives a single forward pass through the shared benchmark, applies the loader-first workaround discipline learned from InternVL3 (eager attention, static-shape masks, default RoPE for compiler gaps), registers the model in perf-bench-matrix.json, and verifies locally on n150 before landing. Use when the user says "add <model> to benchmarks", "wire <model> into nightly", or invokes /add-benchmark-model.
+description: Add a model to the tt-xla benchmark suite and wire it into the nightly perf pipeline. Handles two shapes — single-forward models (vision / llm / encoder / multimodal) via a config-driven test_<model> entry through a shared harness, and multi-component diffusion pipelines (SD / SDXL / Playground / MMDiT) via the four-artifact template (benchmark pipeline + test entry, PCC-gated nightly test, and demo script). Applies the loader-first workaround discipline (InternVL3) and the CPU→TT→CPU eviction / per-component fp32-twin PCC discipline (SDXL-Lightning, Playground v2.5), registers the model in perf-bench-matrix.json, and verifies locally on n150 before landing. Use when the user says "add <model> to benchmarks", "wire <model> into nightly", "add a PCC-gated nightly / demo for <model>", or invokes /add-benchmark-model.
 ---
 
 # add-benchmark-model — tt-xla Benchmark Onboarding
 
 Add a model to `tests/benchmark/` and register it in the nightly perf matrix.
-The reference implementation is the InternVL3 bringup (commit `807201eac`,
-`[Benchmark] Add InternVL3 multimodal benchmark and wire into nightly`). The hard
-lessons from that bringup — what to put in the loader vs the test, and which
-compiler gaps need source-level workarounds — live in
-`references/internvl3-case-study.md`. **Read it before touching a VLM or any model
-that uses HF sdpa / dynamic RoPE / boolean-mask indexing.**
+
+There are **two shapes** of benchmark-add, and the first thing to decide is which one:
+
+1. **Single-forward model** (vision / encoder / LLM / one-tensor VLM) → one `test_<model>`
+   entry driving a shared harness. Reference: the InternVL3 bringup (commit `807201eac`,
+   `[Benchmark] Add InternVL3 multimodal benchmark and wire into nightly`); lessons in
+   `references/internvl3-case-study.md`. **Read it before touching a VLM or any model that
+   uses HF sdpa / dynamic RoPE / boolean-mask indexing.** This is the default path (phases below).
+2. **Multi-component diffusion pipeline** (SD / SDXL / Playground / MMDiT / video-DiT — any
+   multi-stage `DiffusionPipeline`) → a **four-artifact** bringup: a benchmark pipeline +
+   test entry, a **PCC-gated nightly** test, and a **demo script**. References are
+   SDXL-Lightning and Playground v2.5; the full template lives in
+   `references/imagegen-pipeline-template.md`. **Read it before touching any pipeline model**
+   and follow the pipeline phases (§ *Pipeline models* below) instead of the single-forward phases.
 
 Usage: `/add-benchmark-model <model-key-or-loader-path>`
 
@@ -26,6 +34,7 @@ Each modality has a **harness** in `tests/benchmark/benchmarks/` and a
 | LLM (decode/prefill) | `llm_benchmark.py` | `test_llms.py` | token ids, generation |
 | Encoder (embeddings) | `encoder_benchmark.py` | `test_encoders.py` | token ids, single forward |
 | Multimodal / VLM | `multimodal_benchmark.py` | `test_multimodal.py` | **dict** of kwargs (`input_ids`/`attention_mask`/`pixel_values`) |
+| Image-gen / diffusion pipeline | `imagegen_benchmark.py` (+ per-model `benchmarks/<model>_pipeline.py`) | `test_imagegen.py` | text prompt → multi-step denoise → image. **See § Pipeline models** — this is a four-artifact bringup, not a single `test_<model>`. |
 
 The split is deliberate: **model-specific config lives in `test_<model>`, reusable
 measurement logic lives in the harness.** A new model almost always means a new
@@ -33,12 +42,14 @@ measurement logic lives in the harness.** A new model almost always means a new
 new harness for a genuinely new modality (new input contract). If you do, model it
 on the closest existing harness.
 
-## Phases
+## Phases (single-forward models)
 
 Run sequentially. Stop and report to the user if a phase fails — do not silently continue.
+**If the model is a diffusion pipeline, skip these and use § Pipeline models instead.**
 
 ### 1. Classify the model & pick the harness
 - Determine modality from the loader / model card. Map to the table above.
+- **If it's a multi-component `DiffusionPipeline`, stop here and switch to § Pipeline models.**
 - Confirm a `tt-forge-models` loader exists for the model
   (`third_party/tt_forge_models/<family>/pytorch/loader.py` exposing `ModelLoader`,
   `ModelVariant`, `load_model`, `load_inputs`, `get_model_info`). If it does **not**,
@@ -125,7 +136,74 @@ VLM problems, not one-offs.
   the required `Co-Authored-By:` trailer.
 - Hand off to `/create-pr` (area `Benchmark` / `Test Infra`).
 
+## Pipeline models (diffusion / multi-component)
+
+For a multi-stage `DiffusionPipeline`, a benchmark-add is a **four-artifact** bringup, not a
+single `test_<model>`. **Read `references/imagegen-pipeline-template.md` first** — it has the
+exact code shape, the frozen `_perf` schema, the CPU→TT→CPU eviction discipline, and the
+SDXL-Lightning / Playground v2.5 knob tables. Run these phases sequentially; stop and report
+on any failure.
+
+### P1. Classify & confirm the pipeline
+- Confirm it's a genuine multi-component pipeline (text encoder(s) + heavy net + VAE) with a
+  `tt-forge-models` loader exposing per-component `ModelVariant`s. If the loader is missing
+  or single-component, this is a bringup/scaffold — point the user at `/model-bringup`
+  (`model-bringup-scaffold-pipeline`), not here.
+- Pull the model's own reference `DiffusionPipeline` to read the **scheduler class, step
+  count, guidance/CFG, and VAE scaling** — these are per-model and must NOT be copied from
+  the reference models.
+
+### P2. Establish the generate() flow on CPU
+- Run one CPU forward of the full pipeline (all components fp32) to confirm a finite image
+  and to fix the exact tensor flow (tokenize → TE1 → TE2 → denoise loop → VAE decode),
+  including CFG batch handling if the model uses guidance. This flow is shared across all
+  four artifacts.
+
+### P3. Artifact 1 — benchmark pipeline (`benchmarks/<model>_pipeline.py`)
+- Write `<Model>Config` (per-component `_on_tt` toggles + `compile_options`) and
+  `<Model>Pipeline`. Load all components on CPU; register `.compile(backend="tt")` in
+  `load_models()`; do the **CPU→TT→CPU eviction** inline in `generate()` (one component
+  resident at a time). UNet in **bf16**, text encoders + VAE in **fp32**.
+- Populate the frozen `_perf` dict every `generate()` call.
+- Apply model opt-level rules (SDXL/Playground: TE+UNet at `optimization_level=0`, VAE
+  switched to `1` inline and restored). Confirm the model's real requirement — don't assume.
+
+### P4. Artifact 2 — benchmark test entry (`test_imagegen.py::test_<model>`)
+- Add a thin `test_<model>(output_file, request)` that imports the pipeline **inside the
+  function**, defines `build_pipeline_fn(compile_options)` → `(pipeline, generate_fn)`, and
+  calls the shared `test_imagegen(...)`. Thread `compile_options` into the Config.
+
+### P5. Artifact 3 — PCC-gated nightly (`tests/torch/models/<model>/test_<model>_pipeline.py`)
+- Same flow but **all components on TT**, each forward checked against a lazy **fp32 CPU
+  twin** fed the *same input* (clone inputs before the CPU→TT move); assert
+  `pcc >= PCC_THRESHOLD` (0.99) and **fail fast**. UNet checked every step. Copy the nightly
+  markers + `record_test_properties` block verbatim (change names).
+
+### P6. Artifact 4 — demo script (`examples/pytorch/<model>.py`)
+- Standalone runnable (`python examples/pytorch/<model>.py`), no pytest/PCC/perf — same flow,
+  saves a PNG for human eyeballing. Mirror `examples/pytorch/sdxl_lightning.py`.
+
+### P7. Wire into the matrix
+- Append `{ "name": "<model>", "pytest": "tests/benchmark/test_imagegen.py::test_<model>" }`
+  to the `tests` array (single top-level list entry) in `perf-bench-matrix.json`. `runs-on`
+  override only for multichip/big models.
+
+### P8. Verify on n150
+- Benchmark entry passes (two-pass warmup + steady-state, image saved), nightly PCC ≥ 0.99
+  on every component, demo produces a sane image. Record wall-clock (pipelines compile slowly)
+  and surface any nightly-timeout implication to the user.
+
+### P9. Pre-commit, commit, PR
+- `pre-commit run --files <changed files>`. Split commits along the landing-PR grain if the
+  user wants (benchmark wire-in, then PCC-gated nightly + demo) or land together. Titles like
+  `[<Model>] Wire e2e pipeline into nightly and benchmark CI` and
+  `<Model>: add PCC-gated nightly + demo scripts`. Hand off to `/create-pr`.
+
 ## Definition of done
+
+For **pipeline models**, use the pipeline checklist in
+`references/imagegen-pipeline-template.md` instead. For **single-forward models**:
+
 - [ ] `test_<model>` added to the correct test file, model-specific config self-contained.
 - [ ] Workarounds in the loader (or test, with a comment justifying the interim placement).
 - [ ] Entry registered in `perf-bench-matrix.json` with valid JSON and minimal keys.
